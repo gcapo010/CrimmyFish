@@ -88,6 +88,14 @@ _DEFAULTS: dict = {
     },
     "max_bite_wait_seconds": 90,
     "max_fight_seconds": 180,
+    # Populated by memory_scanner.py.  When enabled=True the bot reads game
+    # memory instead of (or in addition to) CV for state detection.
+    "memory": {
+        "enabled": False,
+        "process_name": "CrimsonDesert.exe",
+        "state_address": 0,
+        "state_map": {},
+    },
 }
 
 

@@ -4,15 +4,12 @@ main.py — Entry point and fishing state machine.
 Fishing loop states:
   IDLE → CASTING → WAITING_BITE → HOOKING → FIGHTING → REELING → POST_CATCH → IDLE
 
-Key mechanics based on Crimson Desert's actual fishing system:
-  - Cast:      Hold left mouse button (0.8–1.2 s) then release
-  - Bite:      Detected via water-splash motion burst in the cast-area region,
-               with optional template match overlay
-  - Hook:      Right mouse click
-  - Fight:     Camera-motion direction via phaseCorrelate; counter with opposite WASD key
-  - Tired:     Camera motion drops below still_threshold → fish is tired
-  - Reel:      Hold Space until catch-complete template detected
-  - Post-catch: Press F to stow the fish, then restart
+Detection strategy (in priority order):
+  1. Memory reader (memory_reader.py) — reads the game's own fishing-state integer
+     directly from process memory.  Zero latency, 100 % reliable.  Requires a
+     one-time scan with memory_scanner.py to find the address.
+  2. CV fallback — vision.py frame-diff / template / phaseCorrelate detectors.
+     Used automatically when memory.enabled=false or the address is unavailable.
 """
 
 import threading
@@ -25,6 +22,7 @@ import config
 import gui as gui_module
 import input_controller as ic
 import logger
+import memory_reader
 import vision
 
 
@@ -54,6 +52,7 @@ class FishingLoop:
         ic.set_stopped(False)
         ic.set_paused(False)
         self._cfg = config.load()
+        memory_reader.get_reader(self._cfg)   # init singleton (no-op if disabled)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         logger.info("Fishing loop started.")
@@ -143,24 +142,36 @@ class FishingLoop:
 
     def _wait_for_bite(self, cfg: dict, delays: dict) -> bool:
         """
-        Poll for a fish bite.
+        Wait for a fish bite, using memory detection when available.
 
-        Primary detector — scene-change on motion_sample (centre screen):
-          When a fish bites, Crimson Desert pitches the camera sharply
-          downward.  The horizon rises from ~30 % to ~10 % of the frame
-          and water fills the majority of the screen.  Mean-abs-diff on
-          the centre region typically jumps to 25–60 at bite time versus
-          a 1–5 baseline during idle ripple.
+        Memory path: polls get_state() until the state is "bite" (or equivalent
+        as mapped by the scanner).  Zero false-positive risk.
 
-        A 2-second warm-up seeds the baseline from actual "line-in-water"
-        frames, preventing the cast animation itself from triggering the
-        detector (cast motion can also produce a large scene diff).
+        CV fallback: mean-abs-diff scene-change on the centre-screen region,
+        with water-splash motion burst + template/colour as secondary checks.
+        A 2-second warm-up seeds the baseline after casting to avoid triggering
+        on the cast animation itself.
 
         Returns True on bite, False on timeout.
         """
         timeout  = cfg.get("max_bite_wait_seconds", 90)
-        deadline = time.monotonic() + timeout
         interval = delays["bite_poll_interval"]
+
+        # ── Memory path ───────────────────────────────────────────────────
+        reader = memory_reader.get_reader()
+        if reader:
+            self._status("Waiting for bite (memory)…")
+            # State leaves "waiting" → "bite"
+            hit = reader.wait_for_state("bite", timeout, stop_fn=ic.is_stopped)
+            if hit:
+                logger.info("Bite detected via memory state.")
+                self._gui.set_confidence(1.0)
+            else:
+                logger.info("Bite timeout (memory).")
+            return hit
+
+        # ── CV fallback ───────────────────────────────────────────────────
+        deadline = time.monotonic() + timeout
 
         thresholds    = cfg["thresholds"]
         region_cam    = cfg["regions"].get("motion_sample")
@@ -170,11 +181,6 @@ class FishingLoop:
         sc_threshold  = thresholds.get("bite_scene_change", 25.0)
         mot_threshold = thresholds["bite_motion"]
 
-        # ── Warm-up: build a stable baseline before enabling detection ────
-        # The cast animation can produce a large scene diff.  Running the
-        # detector immediately after after_cast_settle would fire on that
-        # motion.  Instead we sample frames for 2 s without triggering so
-        # prev_cam reflects the actual settled "waiting for bite" scene.
         self._status("Settling…")
         warmup_end = time.monotonic() + 2.0
         prev_cam = prev_bite = None
@@ -189,7 +195,7 @@ class FishingLoop:
                 prev_bite = f
             ic.safe_sleep(0.1)
 
-        self._status("Waiting for bite…")
+        self._status("Waiting for bite (CV)…")
         poll_n = 0
 
         while time.monotonic() < deadline:
@@ -200,14 +206,12 @@ class FishingLoop:
 
             poll_n += 1
 
-            # ── Primary: dramatic scene change (camera pitch at bite) ──────
             curr_cam = vision.grab_region(region_cam)
             if curr_cam is not None and prev_cam is not None:
                 hit, diff = vision.detect_bite_scene_change(
                     prev_cam, curr_cam, threshold=sc_threshold
                 )
                 self._gui.set_confidence(min(diff / max(sc_threshold, 1e-6), 1.0))
-                # Log current diff every ~2 s so the user can see the noise floor
                 if poll_n % 20 == 0:
                     logger.debug(
                         "Bite watch: scene_diff=%.1f  threshold=%.1f",
@@ -221,7 +225,6 @@ class FishingLoop:
                     return True
                 prev_cam = curr_cam
 
-            # ── Fallback: water-splash frame-diff + template + colour ──────
             detected, conf, prev_bite = vision.detect_bite(
                 region=region_bite,
                 template_path=tmpl,
@@ -246,20 +249,17 @@ class FishingLoop:
 
     def _hook(self, cfg: dict, delays: dict) -> None:
         """
-        Send right-click at 0.5 s intervals until camera motion confirms
-        the fish is on the line, or max_hook_attempts is exhausted.
+        Send right-click at 0.5 s intervals until the fish is confirmed hooked,
+        or max_hook_attempts is exhausted.
 
-        After a successful hook the fish starts pulling, which shows up as
-        camera motion (phaseCorrelate magnitude > hook_confirm_motion).
-        Checking motion after each click lets us stop as soon as we know
-        the hook landed rather than guessing a fixed delay.
+        Confirmation strategy:
+          Memory: wait for state to change from "bite" → "fight" (or any non-bite state).
+          CV: check phaseCorrelate magnitude > hook_confirm_motion after each click.
         """
-        region          = cfg["regions"].get("motion_sample")
-        max_attempts    = cfg.get("max_hook_attempts", 8)
-        retry_interval  = delays.get("hook_retry_interval", 0.5)
-        confirm_thresh  = cfg["thresholds"].get("hook_confirm_motion", 1.5)
+        max_attempts   = cfg.get("max_hook_attempts", 8)
+        retry_interval = delays.get("hook_retry_interval", 0.5)
 
-        prev_frame = vision.grab_region(region)
+        reader = memory_reader.get_reader()
 
         for attempt in range(1, max_attempts + 1):
             if ic.is_stopped():
@@ -271,19 +271,29 @@ class FishingLoop:
 
             ic.safe_sleep(retry_interval)
 
-            curr_frame = vision.grab_region(region)
-            if curr_frame is not None and prev_frame is not None:
-                dx, dy   = vision.measure_camera_motion(prev_frame, curr_frame)
-                magnitude = (dx * dx + dy * dy) ** 0.5
-                logger.info(
-                    "Hook check %d: motion=%.2f (need %.2f)",
-                    attempt, magnitude, confirm_thresh,
-                )
-                if magnitude >= confirm_thresh:
-                    logger.info("Fish hooked and pulling! (confirmed on attempt %d)", attempt)
+            if reader:
+                state = reader.get_state()
+                if state and state not in ("bite", "waiting", "idle"):
+                    logger.info("Fish hooked — state now '%s' (attempt %d).", state, attempt)
                     self._status("Fish hooked!")
                     return
-            prev_frame = curr_frame
+            else:
+                region         = cfg["regions"].get("motion_sample")
+                confirm_thresh = cfg["thresholds"].get("hook_confirm_motion", 1.5)
+                prev_frame     = vision.grab_region(region)
+                ic.safe_sleep(0.05)
+                curr_frame = vision.grab_region(region)
+                if curr_frame is not None and prev_frame is not None:
+                    dx, dy    = vision.measure_camera_motion(prev_frame, curr_frame)
+                    magnitude = (dx * dx + dy * dy) ** 0.5
+                    logger.info(
+                        "Hook check %d: motion=%.2f (need %.2f)",
+                        attempt, magnitude, confirm_thresh,
+                    )
+                    if magnitude >= confirm_thresh:
+                        logger.info("Fish hooked! (motion confirmed, attempt %d)", attempt)
+                        self._status("Fish hooked!")
+                        return
 
         logger.warning("Hook not confirmed after %d attempts — proceeding.", max_attempts)
         self._status("Hooking (unconfirmed)…")
@@ -294,28 +304,72 @@ class FishingLoop:
 
     def _fight(self, cfg: dict, delays: dict) -> bool:
         """
-        Read camera motion via phaseCorrelate to determine which way the fish
-        is pulling, then press the opposite WASD key.
+        Counter the fish's movement until it tires out or the state changes.
 
-        A grace period (min_fight_seconds) prevents the "fish tired" check
-        from triggering immediately after hooking, before the fish has had
-        time to start pulling and the camera has had time to start moving.
+        Memory path: keeps pressing the counter-WASD key while state == "fight";
+        exits as soon as state transitions to "caught" or "idle".
 
-        When the camera stops moving (magnitude < still_threshold) after the
-        grace period, the fish is tired — return True to proceed to reeling.
-        Returns False only on timeout.
+        CV fallback: phaseCorrelate camera-motion direction → counter key.
+        A grace period (min_fight_seconds) prevents the tired-check from
+        triggering immediately after hooking before the camera starts moving.
+
+        Returns True when the fish is ready to reel, False on timeout.
         """
         self._status("Fighting fish…")
-        timeout          = cfg.get("max_fight_seconds", 180)
-        min_fight        = cfg.get("min_fight_seconds", 6.0)
-        deadline         = time.monotonic() + timeout
-        grace_end        = time.monotonic() + min_fight
-        interval         = delays["fight_frame_interval"]
+        timeout   = cfg.get("max_fight_seconds", 180)
+        min_fight = cfg.get("min_fight_seconds", 6.0)
+        deadline  = time.monotonic() + timeout
+        grace_end = time.monotonic() + min_fight
+        interval  = delays["fight_frame_interval"]
 
         of_cfg         = cfg["optical_flow"]
         direction_keys = cfg["direction_keys"]
         region         = cfg["regions"]["motion_sample"]
 
+        reader = memory_reader.get_reader()
+
+        # ── Memory path ───────────────────────────────────────────────────
+        if reader:
+            prev_frame = vision.grab_region(region)
+
+            while time.monotonic() < deadline:
+                if ic.is_stopped():
+                    return True
+
+                while ic.is_paused():
+                    ic.safe_sleep(0.1)
+
+                state = reader.get_state()
+                if state not in ("fight", None):
+                    logger.info("Fight ended — state now '%s'.", state)
+                    return True
+
+                # Still fighting — read direction from camera and counter it
+                ic.safe_sleep(interval)
+                curr_frame = vision.grab_region(region)
+                if curr_frame is None or prev_frame is None:
+                    prev_frame = curr_frame
+                    continue
+
+                direction, magnitude, _ = vision.detect_fight_direction(
+                    prev_frame,
+                    curr_frame,
+                    motion_threshold=of_cfg["motion_threshold"],
+                    still_threshold=of_cfg["still_threshold"],
+                    dominance_ratio=of_cfg["direction_dominance_ratio"],
+                )
+                self._gui.set_confidence(magnitude)
+                prev_frame = curr_frame
+
+                if direction:
+                    key = direction_keys.get(direction)
+                    if key:
+                        self._status(f"Fighting — {direction} → {key}")
+                        ic.tap_key(key, hold=delays["direction_key_hold"])
+
+            return False
+
+        # ── CV fallback ───────────────────────────────────────────────────
         prev_frame = vision.grab_region(region)
         if prev_frame is None:
             logger.warning("motion_sample region not set — cannot detect fight direction.")
@@ -323,7 +377,7 @@ class FishingLoop:
 
         while time.monotonic() < deadline:
             if ic.is_stopped():
-                return True  # Clean exit, not a timeout
+                return True
 
             while ic.is_paused():
                 ic.safe_sleep(0.1)
@@ -350,7 +404,7 @@ class FishingLoop:
                         "Camera still (mag=%.2f) but in grace period — waiting.",
                         magnitude,
                     )
-                    continue  # Don't press keys or exit during grace
+                    continue
                 logger.info("Fish is tired (motion magnitude=%.3f).", magnitude)
                 return True
 
@@ -366,14 +420,14 @@ class FishingLoop:
             else:
                 logger.debug("Motion detected (mag=%.2f) but direction unclear.", magnitude)
 
-        return False  # Timed out
+        return False
 
     # ------------------------------------------------------------------
     # Phase: Reel
     # ------------------------------------------------------------------
 
     def _reel(self, cfg: dict, delays: dict) -> None:
-        """Hold Space until the catch-complete template is detected."""
+        """Hold Space until the catch-complete state is detected."""
         self._status("Reeling in…")
         reel_key = cfg["reel_key"]
         ic.hold_key(reel_key)
@@ -381,6 +435,7 @@ class FishingLoop:
 
         deadline = time.monotonic() + 45  # hard cap
         interval = delays["reel_poll_interval"]
+        reader   = memory_reader.get_reader()
 
         try:
             while time.monotonic() < deadline:
@@ -389,6 +444,16 @@ class FishingLoop:
                 while ic.is_paused():
                     ic.safe_sleep(0.1)
 
+                if reader:
+                    state = reader.get_state()
+                    if state == "caught":
+                        logger.info("Catch complete (memory state=caught).")
+                        self._gui.set_confidence(1.0)
+                        break
+                    ic.safe_sleep(interval)
+                    continue
+
+                # CV fallback
                 caught, conf = vision.detect_catch_complete(
                     cfg["regions"]["catch_indicator"],
                     cfg["templates"].get("catch_complete"),
@@ -485,7 +550,10 @@ def main() -> None:
     )
 
     logger.info("CrimmyFish started. Config: %s", config.CONFIG_PATH)
-    gui.run()
+    try:
+        gui.run()
+    finally:
+        memory_reader.release_reader()
 
 
 if __name__ == "__main__":
