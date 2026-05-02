@@ -19,7 +19,7 @@ import json
 import os
 import sys
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 try:
     from PIL import Image, ImageTk
@@ -57,18 +57,36 @@ ELEMENTS = [
 
 class SpriteCalibratorApp:
     def __init__(self):
-        if not os.path.exists(SHEET_PATH):
-            sys.exit(
-                f"\nSprite sheet not found: {SHEET_PATH}\n"
-                "Drop your spritesheet.png into the sprites/ folder first.\n"
-            )
+        # Root MUST be created first — ImageTk.PhotoImage requires a live Tk instance
+        self._root = tk.Tk()
+        self._root.title("CrimmyFish — Sprite Calibrator")
+        self._root.resizable(False, False)
+
+        sheet_path = self._resolve_sheet()
+        if sheet_path is None:
+            self._root.destroy()
+            return
 
         os.makedirs(EXTRACTED, exist_ok=True)
+
+        if not os.path.exists(CONFIG_PATH):
+            messagebox.showerror(
+                "Config missing",
+                f"sprite_config.json not found:\n{CONFIG_PATH}",
+            )
+            self._root.destroy()
+            return
 
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             self._cfg = json.load(fh)
 
-        self._sheet_pil = Image.open(SHEET_PATH).convert("RGBA")
+        try:
+            self._sheet_pil = Image.open(sheet_path).convert("RGBA")
+        except Exception as exc:
+            messagebox.showerror("Image error", f"Could not open sprite sheet:\n{exc}")
+            self._root.destroy()
+            return
+
         sw, sh = self._sheet_pil.size
         print(f"\nSprite sheet: {sw} x {sh} px")
 
@@ -78,13 +96,10 @@ class SpriteCalibratorApp:
         disp_w = int(sw * self._scale)
         disp_h = int(sh * self._scale)
 
+        # ImageTk.PhotoImage is safe here because tk.Tk() already exists above
         self._sheet_img = ImageTk.PhotoImage(
             self._sheet_pil.resize((disp_w, disp_h), Image.LANCZOS)
         )
-
-        self._root = tk.Tk()
-        self._root.title("CrimmyFish — Sprite Calibrator")
-        self._root.resizable(False, False)
 
         self._disp_w = disp_w
         self._disp_h = disp_h
@@ -95,6 +110,32 @@ class SpriteCalibratorApp:
         self._build_ui(disp_w, disp_h)
         self._prompt_next()
         self._root.mainloop()
+
+    def _resolve_sheet(self) -> "str | None":
+        """Return a path to the sprite sheet, prompting the user if needed."""
+        if os.path.exists(SHEET_PATH):
+            return SHEET_PATH
+
+        # Sheet not in the default location — ask the user to locate it
+        messagebox.showinfo(
+            "Sprite sheet not found",
+            f"spritesheet.png was not found at:\n{SHEET_PATH}\n\n"
+            "Click OK to browse for your sprite sheet, or Cancel to quit.",
+        )
+        chosen = filedialog.askopenfilename(
+            title="Select your sprite sheet",
+            initialdir=SPRITES_DIR,
+            filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return None
+
+        # Copy it to the expected location so future runs find it automatically
+        import shutil
+        os.makedirs(SPRITES_DIR, exist_ok=True)
+        shutil.copy2(chosen, SHEET_PATH)
+        print(f"Copied sprite sheet to {SHEET_PATH}")
+        return SHEET_PATH
 
     def _build_ui(self, w, h):
         info_frame = tk.Frame(self._root, bg="#111", pady=6)
