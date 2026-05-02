@@ -150,37 +150,55 @@ class FishingLoop:
           downward.  The horizon rises from ~30 % to ~10 % of the frame
           and water fills the majority of the screen.  Mean-abs-diff on
           the centre region typically jumps to 25–60 at bite time versus
-          a 1–5 baseline during idle ripple.  phaseCorrelate is NOT used
-          here because the angular change is large enough to alias.
+          a 1–5 baseline during idle ripple.
 
-        Fallback — splash motion burst on bite_indicator:
-          Catches the water disturbance if the scene-change threshold is
-          set higher than needed.
+        A 2-second warm-up seeds the baseline from actual "line-in-water"
+        frames, preventing the cast animation itself from triggering the
+        detector (cast motion can also produce a large scene diff).
 
-        Template matching and colour fallback are also tried if configured.
         Returns True on bite, False on timeout.
         """
-        self._status("Waiting for bite…")
         timeout  = cfg.get("max_bite_wait_seconds", 90)
         deadline = time.monotonic() + timeout
         interval = delays["bite_poll_interval"]
 
-        thresholds     = cfg["thresholds"]
-        region_cam     = cfg["regions"].get("motion_sample")
-        region_bite    = cfg["regions"].get("bite_indicator")
-        tmpl           = cfg["templates"].get("bite")
-        color_cfg      = cfg["color_ranges"].get("bite")
-        sc_threshold   = thresholds.get("bite_scene_change", 25.0)
-        mot_threshold  = thresholds["bite_motion"]
+        thresholds    = cfg["thresholds"]
+        region_cam    = cfg["regions"].get("motion_sample")
+        region_bite   = cfg["regions"].get("bite_indicator")
+        tmpl          = cfg["templates"].get("bite")
+        color_cfg     = cfg["color_ranges"].get("bite")
+        sc_threshold  = thresholds.get("bite_scene_change", 25.0)
+        mot_threshold = thresholds["bite_motion"]
 
-        prev_cam  = vision.grab_region(region_cam)
-        prev_bite = vision.grab_region(region_bite)
+        # ── Warm-up: build a stable baseline before enabling detection ────
+        # The cast animation can produce a large scene diff.  Running the
+        # detector immediately after after_cast_settle would fire on that
+        # motion.  Instead we sample frames for 2 s without triggering so
+        # prev_cam reflects the actual settled "waiting for bite" scene.
+        self._status("Settling…")
+        warmup_end = time.monotonic() + 2.0
+        prev_cam = prev_bite = None
+        while time.monotonic() < warmup_end:
+            if ic.is_stopped():
+                return False
+            f = vision.grab_region(region_cam)
+            if f is not None:
+                prev_cam = f
+            f = vision.grab_region(region_bite)
+            if f is not None:
+                prev_bite = f
+            ic.safe_sleep(0.1)
+
+        self._status("Waiting for bite…")
+        poll_n = 0
 
         while time.monotonic() < deadline:
             if ic.is_stopped():
                 return False
             while ic.is_paused():
                 ic.safe_sleep(0.1)
+
+            poll_n += 1
 
             # ── Primary: dramatic scene change (camera pitch at bite) ──────
             curr_cam = vision.grab_region(region_cam)
@@ -189,8 +207,17 @@ class FishingLoop:
                     prev_cam, curr_cam, threshold=sc_threshold
                 )
                 self._gui.set_confidence(min(diff / max(sc_threshold, 1e-6), 1.0))
+                # Log current diff every ~2 s so the user can see the noise floor
+                if poll_n % 20 == 0:
+                    logger.debug(
+                        "Bite watch: scene_diff=%.1f  threshold=%.1f",
+                        diff, sc_threshold,
+                    )
                 if hit:
-                    logger.info("Bite! scene-change diff=%.1f (threshold %.1f)", diff, sc_threshold)
+                    logger.info(
+                        "Bite! scene-change diff=%.1f (threshold %.1f)",
+                        diff, sc_threshold,
+                    )
                     return True
                 prev_cam = curr_cam
 

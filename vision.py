@@ -314,14 +314,16 @@ def detect_catch_complete(
     threshold: float = 0.80,
 ) -> tuple[bool, float]:
     """
-    Detect the fish-caught state using template match (primary) or the
-    distinctive golden fish-info panel that appears bottom-right
-    (fallback — no template required).
+    Detect the fish-caught state.
 
-    Crimson Desert shows a golden-text info panel (fish name, size,
-    description, illustration) in the bottom-right corner the moment the
-    character holds up the caught fish.  Detecting a sufficient density of
-    golden/amber pixels in that region is reliable and needs no calibration.
+    Primary: template match against templates/catch_complete.png saved
+    during calibration.  This is the most reliable method.
+
+    Fallback (only when no template exists): golden HSV colour density in
+    the catch_indicator region.  The fish-info panel title text is a warm
+    amber-gold (HSV H≈30-48, S≈140, V≈160).  The threshold is set high
+    (8 % of pixels) to avoid false positives from the gold-coloured fishing
+    rod, character trim, and UI elements visible during normal gameplay.
 
     Returns (detected, confidence).
     """
@@ -329,14 +331,19 @@ def detect_catch_complete(
     if frame is None:
         return False, 0.0
 
-    # Primary: template match if one has been captured
+    # Primary: calibrated template match
     if template_path:
         detected, conf = match_template(frame, template_path, threshold)
         if detected:
             return True, conf
+        # Template exists but didn't match — skip colour fallback to avoid
+        # the false-positive risk when a good template is already in place.
+        return False, conf
 
-    # Fallback: golden info-panel colour detection.
-    # The fish name text is a warm amber-gold: HSV H≈30-48, S≈140-255, V≈160-255.
+    # Fallback (no template): golden panel colour detection.
+    # Requires a large fraction of golden pixels (8 %) so ambient gold from
+    # gear/rod/UI doesn't trigger it.  Run calibration to get a template
+    # and avoid relying on this path.
     hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask  = cv2.inRange(
         hsv,
@@ -344,9 +351,8 @@ def detect_catch_complete(
         np.array([48, 255, 255], dtype=np.uint8),
     )
     ratio = float(np.count_nonzero(mask)) / max(float(mask.size), 1)
-    # ~1 % golden pixels in the catch_indicator region is a strong signal
-    if ratio >= 0.01:
-        return True, min(ratio / 0.03, 1.0)
+    if ratio >= 0.08:
+        return True, min(ratio / 0.12, 1.0)
 
     return False, 0.0
 

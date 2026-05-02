@@ -229,13 +229,18 @@ class CalibrationManager:
                 g_w = cv2.cvtColor(cw, cv2.COLOR_BGR2GRAY).astype(np.float32)
                 idle_noise = float(np.abs(g_i - g_w).mean())
 
-        threshold = max(round(diff * 0.50, 1), 8.0)
+        # 65 % of the observed bite diff.
+        # 50 % was too aggressive — small ambient variations in the waiting
+        # scene or a slight cast-animation residual could exceed it.
+        # 65 % leaves a wider gap above the noise floor while still sitting
+        # comfortably below the actual bite magnitude.
+        threshold = max(round(diff * 0.65, 1), 10.0)
         cfg["thresholds"]["bite_scene_change"] = threshold
         self._status(
             f"Bite scene-change threshold:\n"
             f"  idle baseline diff = {idle_noise:.1f}\n"
             f"  waiting→bite diff  = {diff:.1f}\n"
-            f"  threshold set to   = {threshold:.1f}  (50% of bite diff)"
+            f"  threshold set to   = {threshold:.1f}  (65% of bite diff)"
         )
 
     def _save_catch_template(self, cfg: dict, frames: dict) -> None:
