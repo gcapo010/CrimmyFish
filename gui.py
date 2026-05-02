@@ -385,7 +385,9 @@ class FishingGUI:
             tk.Label(body, text=label + ":", bg=_ROW_BG,
                      fg=_TEXT_DIM, font=("Georgia", 9)).pack(side=tk.LEFT)
             tk.Label(body, textvariable=var, bg=_ROW_BG,
-                     fg=_GOLD_HI, font=("Georgia", 13, "bold")).pack(side=tk.RIGHT)
+                     fg=_GOLD_HI, font=("Georgia", 13, "bold"),
+                     wraplength=_STAT_W - 80, anchor="e",
+                     justify="right").pack(side=tk.RIGHT)
 
     # ── Buttons ────────────────────────────────────────────────────────────
 
@@ -471,7 +473,12 @@ class FishingGUI:
     # ── Public updates (thread-safe) ───────────────────────────────────────
 
     def set_status(self, text: str):
-        self._root.after(0, lambda: self._status_var.set(text))
+        # Status label is compact — show only the first line, truncated.
+        # Full calibration instructions are always visible in the log panel.
+        first = text.split('\n')[0].strip()
+        if len(first) > 42:
+            first = first[:39] + "…"
+        self._root.after(0, lambda: self._status_var.set(first))
 
     def set_confidence(self, conf: float):
         self._root.after(0, lambda: self._conf_var.set(f"{conf:.3f}"))
