@@ -52,6 +52,9 @@ _DEFAULTS: dict = {
         # camera tilt.  Idle water ≈ 1–5, fight panning ≈ 5–15, bite tilt ≈ 25–60.
         # Lower if bites are missed; raise if ambient scene changes false-trigger.
         "bite_scene_change": 25.0,
+        # Minimum phaseCorrelate magnitude on motion_sample after a hook click
+        # that confirms the fish is on the line and starting to fight.
+        "hook_confirm_motion": 1.5,
         "catch_complete": 0.80,
         "color_pixel_ratio": 0.04,
     },
@@ -63,13 +66,16 @@ _DEFAULTS: dict = {
         # Dominant axis must be this many times larger than the other to pick a direction
         "direction_dominance_ratio": 1.4,
     },
+    # Max right-click attempts before giving up on hooking confirmation.
+    "max_hook_attempts": 8,
+    # Seconds to wait in fight phase before "fish tired" can trigger.
+    # Prevents exiting fight immediately after hooking while camera settles.
+    "min_fight_seconds": 6.0,
     "delays": {
         "after_cast_settle": 1.5,
         "bite_poll_interval": 0.10,
-        # Wait after bite detected before right-clicking to hook.
-        # ~1 s gives the animation time to settle so the click registers.
-        "pre_hook_wait_min": 0.8,
-        "pre_hook_wait_max": 1.2,
+        # Interval between hook retry clicks and the motion-check window.
+        "hook_retry_interval": 0.5,
         "after_hook_min": 0.25,
         "after_hook_max": 0.55,
         "fight_frame_interval": 0.08,

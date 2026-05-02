@@ -245,18 +245,48 @@ class FishingLoop:
     # ------------------------------------------------------------------
 
     def _hook(self, cfg: dict, delays: dict) -> None:
-        # Wait a moment after bite before clicking — lets the animation settle
-        # so the right-click registers as a hook rather than being dropped.
-        pre_wait = (
-            delays.get("pre_hook_wait_min", 0.8)
-            + (delays.get("pre_hook_wait_max", 1.2) - delays.get("pre_hook_wait_min", 0.8))
-            * __import__("random").random()
-        )
-        self._status(f"Bite! Hooking in {pre_wait:.1f}s…")
-        ic.safe_sleep(pre_wait)
-        ic.click_mouse(cfg["hook_button"])
-        ic.random_sleep(delays["after_hook_min"], delays["after_hook_max"])
-        logger.info("Hook click sent (pre-wait %.2fs).", pre_wait)
+        """
+        Send right-click at 0.5 s intervals until camera motion confirms
+        the fish is on the line, or max_hook_attempts is exhausted.
+
+        After a successful hook the fish starts pulling, which shows up as
+        camera motion (phaseCorrelate magnitude > hook_confirm_motion).
+        Checking motion after each click lets us stop as soon as we know
+        the hook landed rather than guessing a fixed delay.
+        """
+        region          = cfg["regions"].get("motion_sample")
+        max_attempts    = cfg.get("max_hook_attempts", 8)
+        retry_interval  = delays.get("hook_retry_interval", 0.5)
+        confirm_thresh  = cfg["thresholds"].get("hook_confirm_motion", 1.5)
+
+        prev_frame = vision.grab_region(region)
+
+        for attempt in range(1, max_attempts + 1):
+            if ic.is_stopped():
+                return
+
+            self._status(f"Hooking… (attempt {attempt}/{max_attempts})")
+            ic.click_mouse(cfg["hook_button"])
+            logger.info("Hook click %d/%d sent.", attempt, max_attempts)
+
+            ic.safe_sleep(retry_interval)
+
+            curr_frame = vision.grab_region(region)
+            if curr_frame is not None and prev_frame is not None:
+                dx, dy   = vision.measure_camera_motion(prev_frame, curr_frame)
+                magnitude = (dx * dx + dy * dy) ** 0.5
+                logger.info(
+                    "Hook check %d: motion=%.2f (need %.2f)",
+                    attempt, magnitude, confirm_thresh,
+                )
+                if magnitude >= confirm_thresh:
+                    logger.info("Fish hooked and pulling! (confirmed on attempt %d)", attempt)
+                    self._status("Fish hooked!")
+                    return
+            prev_frame = curr_frame
+
+        logger.warning("Hook not confirmed after %d attempts — proceeding.", max_attempts)
+        self._status("Hooking (unconfirmed)…")
 
     # ------------------------------------------------------------------
     # Phase: Fight
@@ -267,18 +297,24 @@ class FishingLoop:
         Read camera motion via phaseCorrelate to determine which way the fish
         is pulling, then press the opposite WASD key.
 
-        When the camera stops moving (magnitude < still_threshold) the fish is
-        tired and we return True to proceed to reeling.
+        A grace period (min_fight_seconds) prevents the "fish tired" check
+        from triggering immediately after hooking, before the fish has had
+        time to start pulling and the camera has had time to start moving.
+
+        When the camera stops moving (magnitude < still_threshold) after the
+        grace period, the fish is tired — return True to proceed to reeling.
         Returns False only on timeout.
         """
         self._status("Fighting fish…")
-        timeout = cfg.get("max_fight_seconds", 180)
-        deadline = time.monotonic() + timeout
-        interval = delays["fight_frame_interval"]
+        timeout          = cfg.get("max_fight_seconds", 180)
+        min_fight        = cfg.get("min_fight_seconds", 6.0)
+        deadline         = time.monotonic() + timeout
+        grace_end        = time.monotonic() + min_fight
+        interval         = delays["fight_frame_interval"]
 
-        of_cfg = cfg["optical_flow"]
+        of_cfg         = cfg["optical_flow"]
         direction_keys = cfg["direction_keys"]
-        region = cfg["regions"]["motion_sample"]
+        region         = cfg["regions"]["motion_sample"]
 
         prev_frame = vision.grab_region(region)
         if prev_frame is None:
@@ -307,7 +343,14 @@ class FishingLoop:
             self._gui.set_confidence(magnitude)
             prev_frame = curr_frame
 
+            in_grace = time.monotonic() < grace_end
             if is_tired:
+                if in_grace:
+                    logger.debug(
+                        "Camera still (mag=%.2f) but in grace period — waiting.",
+                        magnitude,
+                    )
+                    continue  # Don't press keys or exit during grace
                 logger.info("Fish is tired (motion magnitude=%.3f).", magnitude)
                 return True
 

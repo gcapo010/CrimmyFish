@@ -55,9 +55,22 @@ _STEPS = [
         "Press F6 the INSTANT the camera starts to tilt toward the water.",
     ),
     (
-        "fight",
-        "FIGHTING — Camera is actively panning while fighting the fish.\n"
-        "Press F6 while the camera is moving (do NOT wait until fish is tired).",
+        "hooked",
+        "FISH HOOKED — The fish is on the line and actively pulling.\n"
+        "You should already see camera motion. Press F6 to capture this state.\n"
+        "This is used to confirm the hook landed.",
+    ),
+    (
+        "fight_left",
+        "FIGHTING — FISH PULLING LEFT — Camera is panning RIGHT.\n"
+        "Press F6 while the camera is visibly moving to the right.\n"
+        "Two frames will be captured automatically to measure the motion vector.",
+    ),
+    (
+        "fight_right",
+        "FIGHTING — FISH PULLING RIGHT — Camera is panning LEFT.\n"
+        "Press F6 while the camera is visibly moving to the left.\n"
+        "Two frames will be captured automatically to measure the motion vector.",
     ),
     (
         "catch",
@@ -65,6 +78,9 @@ _STEPS = [
         "Press F6 when the panel is fully on screen.",
     ),
 ]
+
+# Steps that need two frames (captured at F6 + 150 ms later) to measure motion.
+_PAIR_STEPS = {"fight_left", "fight_right"}
 
 
 # ── Manager ────────────────────────────────────────────────────────────────
@@ -116,6 +132,21 @@ class CalibrationManager:
         self._status(f"  ✓  {step_name}  ({w}×{h} px captured)")
         return frame
 
+    def _capture_on_f6_pair(self, step_name: str, prompt: str):
+        """
+        Capture a frame at F6 press, then a second frame 150 ms later.
+        Returns (frame_a, frame_b) or None if the step was skipped.
+        The two frames are used with phaseCorrelate to measure a motion vector.
+        """
+        import time as _time
+        f1 = self._capture_on_f6(step_name, prompt)
+        if f1 is None:
+            return None
+        _time.sleep(0.15)
+        f2 = vision.grab_full_screen()
+        self._status("  Second frame captured for motion measurement.")
+        return (f1, f2)
+
     # ── Public entry point ─────────────────────────────────────────────────
 
     def run_full_calibration(self) -> None:
@@ -130,20 +161,24 @@ class CalibrationManager:
             "Defaults are kept for any skipped step."
         )
 
-        frames: dict[str, Optional[np.ndarray]] = {}
+        frames: dict = {}
         for key, prompt in _STEPS:
-            frames[key] = self._capture_on_f6(key, prompt)
+            if key in _PAIR_STEPS:
+                frames[key] = self._capture_on_f6_pair(key, prompt)
+            else:
+                frames[key] = self._capture_on_f6(key, prompt)
 
         self._derive_and_save(frames)
 
     # ── Derivation ─────────────────────────────────────────────────────────
 
-    def _derive_and_save(self, frames: dict[str, Optional[np.ndarray]]) -> None:
+    def _derive_and_save(self, frames: dict) -> None:
         self._status("Analysing captures — deriving thresholds and templates…")
         cfg = config.load()
 
         self._auto_regions(cfg, frames)
         self._derive_bite_threshold(cfg, frames)
+        self._calibrate_fight_directions(cfg, frames)
         self._save_catch_template(cfg, frames)
         self._validate_fight(cfg, frames)
 
@@ -271,6 +306,82 @@ class CalibrationManager:
             f"Catch template saved: {path}\n"
             f"  ({crop.shape[1]}×{crop.shape[0]} px)"
         )
+
+    def _calibrate_fight_directions(self, cfg: dict, frames: dict) -> None:
+        """
+        Use the fight_left and fight_right frame pairs to:
+          1. Measure actual phaseCorrelate dx/dy during active fighting.
+          2. Set motion_threshold to 40% of the observed magnitude so
+             normal fight motion is reliably detected.
+          3. Confirm the direction convention (dx > 0 = world right =
+             camera left = fish going left).
+          4. Derive hook_confirm_motion from the hooked frame vs idle.
+        """
+        magnitudes = []
+        r = cfg["regions"]["motion_sample"]
+
+        def crop(f):
+            h, w = f.shape[:2]
+            x2 = min(r["left"] + r["width"],  w)
+            y2 = min(r["top"]  + r["height"], h)
+            return f[r["top"]:y2, r["left"]:x2]
+
+        for label, direction_name in [("fight_left", "left"), ("fight_right", "right")]:
+            pair = frames.get(label)
+            if pair is None or not isinstance(pair, tuple):
+                self._status(f"Skipping fight-direction calibration for '{label}'.")
+                continue
+
+            f1, f2 = pair
+            c1, c2 = crop(f1), crop(f2)
+            if c1.size == 0 or c2.size == 0:
+                continue
+
+            dx, dy  = vision.measure_camera_motion(c1, c2)
+            mag     = (dx * dx + dy * dy) ** 0.5
+            magnitudes.append(mag)
+
+            # Direction convention check:
+            #   fish pulling LEFT  → camera pans right → world shifts right → dx > 0
+            #   fish pulling RIGHT → camera pans left  → world shifts left  → dx < 0
+            if direction_name == "left":
+                conv = "correct" if dx > 0 else "REVERSED — check direction_keys in config"
+            else:
+                conv = "correct" if dx < 0 else "REVERSED — check direction_keys in config"
+
+            self._status(
+                f"Fight {direction_name.upper()}: dx={dx:.2f} dy={dy:.2f} "
+                f"mag={mag:.2f}  convention={conv}"
+            )
+
+        if magnitudes:
+            avg_mag = sum(magnitudes) / len(magnitudes)
+            # Set motion_threshold to 40% of observed fight magnitude.
+            # This ensures normal fight motion comfortably exceeds the threshold
+            # while the "still" / tired state (mag ≈ 0) remains well below it.
+            new_threshold = max(round(avg_mag * 0.40, 2), 0.5)
+            cfg["optical_flow"]["motion_threshold"] = new_threshold
+            self._status(
+                f"Fight motion_threshold set to {new_threshold:.2f} "
+                f"(40% of avg observed magnitude {avg_mag:.2f})"
+            )
+
+        # Derive hook_confirm_motion from hooked vs idle frames
+        hooked = frames.get("hooked")
+        idle   = frames.get("idle")
+        if hooked is not None and idle is not None:
+            ci = crop(idle)
+            ch = crop(hooked)
+            if ci.size > 0 and ch.size > 0:
+                dx, dy = vision.measure_camera_motion(ci, ch)
+                mag    = (dx * dx + dy * dy) ** 0.5
+                # Threshold at 40% of observed hook-state motion
+                hook_thresh = max(round(mag * 0.40, 2), 0.5)
+                cfg["thresholds"]["hook_confirm_motion"] = hook_thresh
+                self._status(
+                    f"Hook confirm motion set to {hook_thresh:.2f} "
+                    f"(40% of measured hooked magnitude {mag:.2f})"
+                )
 
     def _validate_fight(self, cfg: dict, frames: dict) -> None:
         """
