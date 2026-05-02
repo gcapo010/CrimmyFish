@@ -1,12 +1,18 @@
 """
-main.py — Entry point and main fishing loop.
+main.py — Entry point and fishing state machine.
 
-The fishing loop runs in a background daemon thread so the tkinter GUI stays
-responsive.  State machine:
+Fishing loop states:
+  IDLE → CASTING → WAITING_BITE → HOOKING → FIGHTING → REELING → POST_CATCH → IDLE
 
-  IDLE -> CASTING -> WAITING_BITE -> HOOKING -> FIGHTING -> REELING -> CATCH_COMPLETE -> IDLE
-
-All detections delegate to vision.py; all inputs delegate to input_controller.py.
+Key mechanics based on Crimson Desert's actual fishing system:
+  - Cast:      Hold left mouse button (0.8–1.2 s) then release
+  - Bite:      Detected via water-splash motion burst in the cast-area region,
+               with optional template match overlay
+  - Hook:      Right mouse click
+  - Fight:     Camera-motion direction via phaseCorrelate; counter with opposite WASD key
+  - Tired:     Camera motion drops below still_threshold → fish is tired
+  - Reel:      Hold Space until catch-complete template detected
+  - Post-catch: Press F to stow the fish, then restart
 """
 
 import threading
@@ -22,10 +28,6 @@ import logger
 import vision
 
 
-# ---------------------------------------------------------------------------
-# Fishing state machine
-# ---------------------------------------------------------------------------
-
 class State(Enum):
     IDLE = auto()
     CASTING = auto()
@@ -33,19 +35,13 @@ class State(Enum):
     HOOKING = auto()
     FIGHTING = auto()
     REELING = auto()
-    CATCH_COMPLETE = auto()
+    POST_CATCH = auto()
     STOPPED = auto()
 
 
 class FishingLoop:
-    """
-    Executes the full fishing cycle and reports status back to the GUI.
-    Runs on a separate thread; the GUI is updated via callback functions.
-    """
-
     def __init__(self, gui: "gui_module.FishingGUI"):
         self._gui = gui
-        self._state = State.IDLE
         self._loop_count = 0
         self._thread: Optional[threading.Thread] = None
         self._cfg: dict = {}
@@ -58,14 +54,12 @@ class FishingLoop:
         ic.set_stopped(False)
         ic.set_paused(False)
         self._cfg = config.load()
-        self._state = State.IDLE
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         logger.info("Fishing loop started.")
 
     def stop(self) -> None:
         ic.set_stopped(True)
-        self._state = State.STOPPED
         logger.info("Fishing loop stopped.")
 
     def toggle_pause(self) -> None:
@@ -83,17 +77,15 @@ class FishingLoop:
         delays = cfg["delays"]
 
         while not ic.is_stopped():
-            self._update_status("Idle — waiting to cast")
+            self._status("Idle")
             ic.random_sleep(delays["loop_restart_min"], delays["loop_restart_max"])
             if ic.is_stopped():
                 break
 
-            # 1. Cast
             self._cast(cfg, delays)
             if ic.is_stopped():
                 break
 
-            # 2. Wait for bite
             bit = self._wait_for_bite(cfg, delays)
             if ic.is_stopped():
                 break
@@ -101,47 +93,72 @@ class FishingLoop:
                 logger.info("Bite timeout — recasting.")
                 continue
 
-            # 3. Hook
             self._hook(cfg, delays)
             if ic.is_stopped():
                 break
 
-            # 4. Fight
-            timed_out = self._fight(cfg, delays)
+            fight_ok = self._fight(cfg, delays)
             if ic.is_stopped():
                 break
-            if timed_out:
+            if not fight_ok:
                 logger.warning("Fight timed out — recasting.")
                 continue
 
-            # 5. Reel
             self._reel(cfg, delays)
             if ic.is_stopped():
                 break
 
-            # 6. Catch complete
+            self._post_catch(cfg, delays)
+            if ic.is_stopped():
+                break
+
             self._loop_count += 1
             self._gui.set_loop_count(self._loop_count)
-            logger.info("Fish caught! Total: %d", self._loop_count)
+            logger.info("Fish stowed. Total: %d", self._loop_count)
 
-        self._update_status("Stopped")
+        self._status("Stopped")
 
     # ------------------------------------------------------------------
-    # Individual phase methods
+    # Phase: Cast
     # ------------------------------------------------------------------
 
     def _cast(self, cfg: dict, delays: dict) -> None:
-        self._update_status("Casting…")
-        ic.tap_key(cfg["cast_key"], hold=0.07)
-        ic.random_sleep(delays["after_cast_min"], delays["after_cast_max"])
-        logger.info("Cast performed.")
+        self._status("Casting…")
+        cast_cfg = cfg["cast"]
+        hold = ic.random_sleep.__func__ if False else None  # type hint hint
+
+        # Draw back (hold left mouse) then release to cast
+        hold_time = (
+            cast_cfg["hold_seconds_min"]
+            + (cast_cfg["hold_seconds_max"] - cast_cfg["hold_seconds_min"])
+            * __import__("random").random()
+        )
+        ic.hold_mouse(cast_cfg["button"], hold_time)
+        ic.safe_sleep(delays["after_cast_settle"])
+        logger.info("Cast completed (held %.2fs).", hold_time)
+
+    # ------------------------------------------------------------------
+    # Phase: Wait for bite
+    # ------------------------------------------------------------------
 
     def _wait_for_bite(self, cfg: dict, delays: dict) -> bool:
-        """Poll the bite indicator until detected or timeout. Returns True if bite detected."""
-        self._update_status("Waiting for bite…")
-        timeout = cfg.get("max_bite_wait_seconds", 60)
+        """
+        Poll the bite_indicator region for a motion burst (water splash).
+        Optionally also tries template matching if a template is configured.
+        Returns True when a bite is detected, False on timeout.
+        """
+        self._status("Waiting for bite…")
+        timeout = cfg.get("max_bite_wait_seconds", 90)
         deadline = time.monotonic() + timeout
         interval = delays["bite_poll_interval"]
+
+        thresholds = cfg["thresholds"]
+        region = cfg["regions"]["bite_indicator"]
+        tmpl = cfg["templates"].get("bite")
+        color_cfg = cfg["color_ranges"].get("bite")
+
+        # Seed the previous frame for motion detection
+        prev_frame = vision.grab_region(region)
 
         while time.monotonic() < deadline:
             if ic.is_stopped():
@@ -149,98 +166,117 @@ class FishingLoop:
             while ic.is_paused():
                 ic.safe_sleep(0.1)
 
-            detected, conf = vision.detect_state(
-                cfg["regions"]["bite_indicator"],
-                cfg["templates"]["bite"],
-                cfg["color_ranges"].get("bite"),
-                cfg["thresholds"]["bite"],
-                cfg["thresholds"]["color_pixel_ratio"],
+            detected, conf, prev_frame = vision.detect_bite(
+                region=region,
+                template_path=tmpl,
+                prev_frame=prev_frame,
+                color_cfg=color_cfg,
+                template_threshold=thresholds["bite_template"],
+                motion_threshold=thresholds["bite_motion"],
+                color_pixel_ratio=thresholds["color_pixel_ratio"],
             )
+
             self._gui.set_confidence(conf)
-            logger.debug("Bite check: detected=%s conf=%.3f", detected, conf)
+            logger.debug("Bite poll: detected=%s conf=%.3f", detected, conf)
 
             if detected:
-                logger.info("Bite detected! Confidence=%.3f", conf)
+                logger.info("Bite detected! conf=%.3f", conf)
                 return True
 
             ic.safe_sleep(interval)
 
         return False
 
+    # ------------------------------------------------------------------
+    # Phase: Hook
+    # ------------------------------------------------------------------
+
     def _hook(self, cfg: dict, delays: dict) -> None:
-        self._update_status("Hooking fish!")
+        self._status("Hooking!")
         ic.click_mouse(cfg["hook_button"])
         ic.random_sleep(delays["after_hook_min"], delays["after_hook_max"])
         logger.info("Hook click sent.")
 
+    # ------------------------------------------------------------------
+    # Phase: Fight
+    # ------------------------------------------------------------------
+
     def _fight(self, cfg: dict, delays: dict) -> bool:
         """
-        Fish-fighting phase.
+        Read camera motion via phaseCorrelate to determine which way the fish
+        is pulling, then press the opposite WASD key.
 
-        Detects whether the fish is tired first; if not, reads direction and
-        sends the counter key.  Returns True if the fight timed out.
+        When the camera stops moving (magnitude < still_threshold) the fish is
+        tired and we return True to proceed to reeling.
+        Returns False only on timeout.
         """
-        self._update_status("Fighting fish…")
-        timeout = cfg.get("max_fight_seconds", 120)
+        self._status("Fighting fish…")
+        timeout = cfg.get("max_fight_seconds", 180)
         deadline = time.monotonic() + timeout
-        interval = delays["fight_poll_interval"]
+        interval = delays["fight_frame_interval"]
 
-        dir_templates = {
-            d: cfg["templates"].get(f"direction_{d}")
-            for d in ("left", "right", "up", "down")
-        }
-        dir_keys = cfg["direction_keys"]
+        of_cfg = cfg["optical_flow"]
+        direction_keys = cfg["direction_keys"]
+        region = cfg["regions"]["motion_sample"]
+
+        prev_frame = vision.grab_region(region)
+        if prev_frame is None:
+            logger.warning("motion_sample region not set — cannot detect fight direction.")
+            return False
 
         while time.monotonic() < deadline:
             if ic.is_stopped():
-                return False
+                return True  # Clean exit, not a timeout
+
             while ic.is_paused():
                 ic.safe_sleep(0.1)
 
-            # Check tired state first — it takes priority
-            tired, conf = vision.detect_state(
-                cfg["regions"]["stamina_indicator"],
-                cfg["templates"]["tired"],
-                cfg["color_ranges"].get("tired"),
-                cfg["thresholds"]["tired"],
-                cfg["thresholds"]["color_pixel_ratio"],
-            )
-            self._gui.set_confidence(conf)
+            ic.safe_sleep(interval)
+            curr_frame = vision.grab_region(region)
+            if curr_frame is None:
+                continue
 
-            if tired:
-                logger.info("Fish is tired! Confidence=%.3f", conf)
-                return False  # Proceed to reel
-
-            # Detect direction and counter it
-            frame = vision.grab_region(cfg["regions"]["direction_indicator"])
-            direction, dir_conf = vision.detect_direction(
-                frame, dir_templates, cfg["thresholds"]["direction"]
+            direction, magnitude, is_tired = vision.detect_fight_direction(
+                prev_frame,
+                curr_frame,
+                motion_threshold=of_cfg["motion_threshold"],
+                still_threshold=of_cfg["still_threshold"],
+                dominance_ratio=of_cfg["direction_dominance_ratio"],
             )
+            self._gui.set_confidence(magnitude)
+            prev_frame = curr_frame
+
+            if is_tired:
+                logger.info("Fish is tired (motion magnitude=%.3f).", magnitude)
+                return True
 
             if direction:
-                key = dir_keys.get(direction)
+                key = direction_keys.get(direction)
                 if key:
-                    logger.debug("Fish going %s (conf=%.3f) — pressing %s", direction, dir_conf, key)
-                    self._update_status(f"Fighting — fish going {direction}")
+                    self._status(f"Fighting — fish going {direction}, pressing {key}")
+                    logger.debug(
+                        "Fish direction=%s mag=%.2f → pressing %s",
+                        direction, magnitude, key,
+                    )
                     ic.tap_key(key, hold=delays["direction_key_hold"])
             else:
-                logger.debug("No direction detected — waiting.")
+                logger.debug("Motion detected (mag=%.2f) but direction unclear.", magnitude)
 
-            ic.safe_sleep(interval)
+        return False  # Timed out
 
-        return True  # Timed out
+    # ------------------------------------------------------------------
+    # Phase: Reel
+    # ------------------------------------------------------------------
 
     def _reel(self, cfg: dict, delays: dict) -> None:
-        """Hold the reel key until the catch-complete indicator appears."""
-        self._update_status("Reeling in…")
+        """Hold Space until the catch-complete template is detected."""
+        self._status("Reeling in…")
         reel_key = cfg["reel_key"]
         ic.hold_key(reel_key)
-        logger.info("Reel key held.")
+        logger.info("Space held — reeling.")
 
-        # Poll for catch completion while the key is held
-        timeout = 30  # seconds max for reeling
-        deadline = time.monotonic() + timeout
-        interval = delays.get("bite_poll_interval", 0.1)
+        deadline = time.monotonic() + 45  # hard cap
+        interval = delays["reel_poll_interval"]
 
         try:
             while time.monotonic() < deadline:
@@ -249,32 +285,42 @@ class FishingLoop:
                 while ic.is_paused():
                     ic.safe_sleep(0.1)
 
-                caught, conf = vision.detect_state(
+                caught, conf = vision.detect_catch_complete(
                     cfg["regions"]["catch_indicator"],
-                    cfg["templates"]["catch_complete"],
-                    cfg["color_ranges"].get("catch_complete"),
+                    cfg["templates"].get("catch_complete"),
                     cfg["thresholds"]["catch_complete"],
-                    cfg["thresholds"]["color_pixel_ratio"],
                 )
                 self._gui.set_confidence(conf)
                 logger.debug("Catch check: caught=%s conf=%.3f", caught, conf)
 
                 if caught:
-                    logger.info("Catch complete! Confidence=%.3f", conf)
+                    logger.info("Catch complete! conf=%.3f", conf)
                     break
 
                 ic.safe_sleep(interval)
         finally:
-            # Always release the reel key, even on error
             ic.release_key(reel_key)
 
-        ic.random_sleep(delays["after_reel_min"], delays["after_reel_max"])
+    # ------------------------------------------------------------------
+    # Phase: Post-catch — press F to stow the fish
+    # ------------------------------------------------------------------
+
+    def _post_catch(self, cfg: dict, delays: dict) -> None:
+        """
+        After reeling in, the player is holding the fish.
+        Press F to put it away, then wait before the next cast.
+        """
+        self._status("Stowing fish…")
+        ic.random_sleep(delays["after_catch_min"], delays["after_catch_max"])
+        ic.tap_key(cfg["post_catch_key"], hold=0.08)
+        logger.info("Pressed %s to stow fish.", cfg["post_catch_key"])
+        ic.safe_sleep(0.5)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _update_status(self, text: str) -> None:
+    def _status(self, text: str) -> None:
         logger.info(text)
         self._gui.set_status(text)
 
@@ -284,9 +330,7 @@ class FishingLoop:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Load config early so hotkeys are available before the loop starts
     cfg = config.load()
-
     loop: Optional[FishingLoop] = None
 
     def on_start():
@@ -306,7 +350,6 @@ def main() -> None:
             loop.toggle_pause()
 
     def on_calibrate():
-        """Run calibration in a thread so the GUI stays live."""
         def _run():
             mgr = calibration.CalibrationManager(status_callback=lambda m: gui.set_status(m))
             gui.set_status("Calibrating regions…")
@@ -315,8 +358,7 @@ def main() -> None:
             mgr.calibrate_templates()
             gui.set_status("Calibration complete.")
 
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
+        threading.Thread(target=_run, daemon=True).start()
 
     def on_stop_hotkey():
         on_stop()
@@ -325,7 +367,6 @@ def main() -> None:
     def on_pause_toggle(paused: bool):
         gui.set_paused(paused)
 
-    # Hotkey listener (daemon thread)
     hotkeys = ic.HotkeyListener(
         stop_key=cfg["hotkeys"]["emergency_stop"],
         pause_key=cfg["hotkeys"]["pause_resume"],

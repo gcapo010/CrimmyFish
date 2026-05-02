@@ -1,12 +1,25 @@
 """
-calibration.py — Interactive region-selector and template-saver.
+calibration.py — Interactive region selector and template saver.
 
-Opens a full-screen overlay window on top of the desktop where the user can
-drag a rectangle to select a region.  The selected region coordinates are
-returned so the caller can update config.json and optionally save a template
-screenshot.
+Opens a fullscreen transparent overlay so the user can drag a rectangle to
+select a screen region.  Coordinates are stored in config.json.
 
-Works on X11/Wayland via tkinter (no extra deps beyond the standard library).
+The three regions needed for Crimson Desert fishing:
+
+  bite_indicator   — The water area where the fishing line lands.
+                     Used for motion-burst (splash) detection.
+                     Select a rectangle covering the water surface where
+                     the float will sit.  Avoid the horizon and sky.
+
+  motion_sample    — The central portion of the screen used to measure
+                     camera pan direction during the fight phase.
+                     A large region gives more stable phase-correlation
+                     results.  Default covers the centre 50% of the screen.
+
+  catch_indicator  — The area showing the player character after a catch,
+                     used to detect when the fish is held in hand.
+                     Select the lower-centre area where the character model
+                     is visible.
 """
 
 import os
@@ -14,12 +27,49 @@ import threading
 import tkinter as tk
 from typing import Callable, Optional
 
-import cv2
-import numpy as np
-
 import config
 import logger
 import vision
+
+
+TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
+
+_REGION_PROMPTS = {
+    "bite_indicator": (
+        "BITE INDICATOR — water surface where the float lands.\n"
+        "Drag a box covering the water area in front of the character.\n"
+        "Avoid sky/horizon.  Used for splash motion detection."
+    ),
+    "motion_sample": (
+        "MOTION SAMPLE — centre screen region for camera-pan detection.\n"
+        "Drag a large box covering the centre 40–60% of the screen.\n"
+        "Avoid UI edges.  Used to track fight direction and tired state."
+    ),
+    "catch_indicator": (
+        "CATCH COMPLETE — area showing the player holding the fish.\n"
+        "Drag a box around the player character in the lower-centre area.\n"
+        "Used to detect when it is time to press F to stow the fish."
+    ),
+}
+
+_TEMPLATE_PROMPTS = {
+    "bite": (
+        "BITE SPLASH template.\n"
+        "Switch to the game and trigger a bite (or use a recording screenshot).\n"
+        "Press Enter when the water splash is visible."
+    ),
+    "catch_complete": (
+        "CATCH COMPLETE template.\n"
+        "Switch to the game and pull in a fish so the character holds it.\n"
+        "Press Enter when the character is holding the fish in hand."
+    ),
+}
+
+# Maps template key → region key (for capturing the crop)
+_TEMPLATE_REGION = {
+    "bite": "bite_indicator",
+    "catch_complete": "catch_indicator",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -27,24 +77,16 @@ import vision
 # ---------------------------------------------------------------------------
 
 class RegionSelector:
-    """
-    Draw a semi-transparent fullscreen overlay; user drags a rectangle.
-    Returns {"left": x, "top": y, "width": w, "height": h} on completion,
-    or None if cancelled (Escape).
-    """
+    """Fullscreen drag-to-select overlay. Returns region dict or None on cancel."""
 
-    def __init__(self, prompt: str = "Drag to select region. Press Escape to cancel."):
+    def __init__(self, prompt: str):
         self._prompt = prompt
         self._result: Optional[dict] = None
-        self._start_x = self._start_y = 0
-        self._rect_id = None
-        self._root: Optional[tk.Tk] = None
 
     def select(self) -> Optional[dict]:
-        self._root = tk.Tk()
-        root = self._root
+        root = tk.Tk()
         root.attributes("-fullscreen", True)
-        root.attributes("-alpha", 0.3)
+        root.attributes("-alpha", 0.30)
         root.attributes("-topmost", True)
         root.configure(bg="black")
         root.title("CrimmyFish — Region Selector")
@@ -52,86 +94,57 @@ class RegionSelector:
         canvas = tk.Canvas(root, cursor="crosshair", bg="black", highlightthickness=0)
         canvas.pack(fill=tk.BOTH, expand=True)
 
-        label = tk.Label(
+        tk.Label(
             root,
-            text=self._prompt,
+            text=self._prompt + "\n\nDrag a rectangle then release.  Escape to skip.",
             fg="white",
-            bg="#333333",
-            font=("Helvetica", 14),
-        )
-        label.place(relx=0.5, rely=0.02, anchor="n")
+            bg="#1a1a2e",
+            font=("Helvetica", 13),
+            justify="center",
+            wraplength=900,
+        ).place(relx=0.5, rely=0.03, anchor="n")
 
-        def on_press(event):
-            self._start_x, self._start_y = event.x_root, event.y_root
-            if self._rect_id:
-                canvas.delete(self._rect_id)
+        start = [0, 0]
+        rect_id = [None]
 
-        def on_drag(event):
-            if self._rect_id:
-                canvas.delete(self._rect_id)
-            # Convert from root coords to canvas coords
-            x1 = self._start_x - root.winfo_rootx()
-            y1 = self._start_y - root.winfo_rooty()
-            x2 = event.x
-            y2 = event.y
-            self._rect_id = canvas.create_rectangle(
-                x1, y1, x2, y2, outline="red", width=2, fill="red", stipple="gray25"
+        def on_press(e):
+            start[0], start[1] = e.x_root, e.y_root
+            if rect_id[0]:
+                canvas.delete(rect_id[0])
+
+        def on_drag(e):
+            if rect_id[0]:
+                canvas.delete(rect_id[0])
+            x1 = start[0] - root.winfo_rootx()
+            y1 = start[1] - root.winfo_rooty()
+            rect_id[0] = canvas.create_rectangle(
+                x1, y1, e.x, e.y,
+                outline="#89b4fa", width=2, fill="#89b4fa", stipple="gray25",
             )
 
-        def on_release(event):
-            x1 = min(self._start_x, event.x_root)
-            y1 = min(self._start_y, event.y_root)
-            x2 = max(self._start_x, event.x_root)
-            y2 = max(self._start_y, event.y_root)
+        def on_release(e):
+            x1, y1 = min(start[0], e.x_root), min(start[1], e.y_root)
+            x2, y2 = max(start[0], e.x_root), max(start[1], e.y_root)
             w, h = x2 - x1, y2 - y1
             if w > 5 and h > 5:
                 self._result = {"left": x1, "top": y1, "width": w, "height": h}
             root.destroy()
 
-        def on_escape(event):
-            root.destroy()
-
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
-        root.bind("<Escape>", on_escape)
-
+        root.bind("<Escape>", lambda _: root.destroy())
         root.mainloop()
         return self._result
 
 
 # ---------------------------------------------------------------------------
-# Calibration controller
+# Calibration manager
 # ---------------------------------------------------------------------------
 
-TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
-
-_REGION_LABELS = {
-    "bite_indicator": "BITE INDICATOR — the area that flashes when a fish bites",
-    "direction_indicator": "DIRECTION INDICATOR — the arrow/icon showing fish direction",
-    "stamina_indicator": "STAMINA/TIRED INDICATOR — the bar or icon showing fish stamina",
-    "catch_indicator": "CATCH COMPLETE INDICATOR — the prompt shown when the catch finishes",
-}
-
-_TEMPLATE_LABELS = {
-    "bite": ("bite", "bite_indicator"),
-    "direction_left": ("direction_left", "direction_indicator"),
-    "direction_right": ("direction_right", "direction_indicator"),
-    "direction_up": ("direction_up", "direction_indicator"),
-    "direction_down": ("direction_down", "direction_indicator"),
-    "tired": ("tired", "stamina_indicator"),
-    "catch_complete": ("catch_complete", "catch_indicator"),
-}
-
-
 class CalibrationManager:
-    """
-    Drives the interactive calibration session.
-    Optionally accepts a status_callback(str) for live GUI updates.
-    """
-
     def __init__(self, status_callback: Optional[Callable[[str], None]] = None):
-        self._cb = status_callback or (lambda msg: None)
+        self._cb = status_callback or (lambda _: None)
 
     def _status(self, msg: str) -> None:
         logger.info(msg)
@@ -140,76 +153,75 @@ class CalibrationManager:
     def calibrate_regions(self) -> None:
         """Walk the user through selecting each detection region."""
         cfg = config.load()
-        for key, prompt in _REGION_LABELS.items():
-            self._status(f"Select region: {key}\n{prompt}")
-            selector = RegionSelector(prompt=f"{prompt}\n\nDrag a rectangle, then release.")
-            region = selector.select()
+        for key, prompt in _REGION_PROMPTS.items():
+            self._status(f"Select region: {key}")
+            region = RegionSelector(prompt=prompt).select()
             if region is None:
                 self._status(f"Skipped: {key}")
                 continue
             cfg["regions"][key] = region
-            self._status(f"Saved region {key}: {region}")
+            self._status(f"Saved {key}: {region}")
         config.save(cfg)
-        self._status("All regions saved to config.json.")
+        self._status("Regions saved.")
 
     def calibrate_templates(self, keys: Optional[list] = None) -> None:
         """
-        For each template key, grab the currently configured region and save a
-        screenshot crop as the reference template.
-
-        Call this AFTER calibrate_regions so the regions are set.
+        Capture a reference screenshot for each template from the corresponding
+        configured region.  Call AFTER calibrate_regions.
         """
         cfg = config.load()
         os.makedirs(TEMPLATE_DIR, exist_ok=True)
+        targets = keys or list(_TEMPLATE_PROMPTS.keys())
 
-        targets = keys or list(_TEMPLATE_LABELS.keys())
         for tmpl_key in targets:
-            filename, region_key = _TEMPLATE_LABELS[tmpl_key]
+            region_key = _TEMPLATE_REGION.get(tmpl_key)
             region = cfg["regions"].get(region_key)
             if region is None:
-                self._status(f"No region set for {tmpl_key} — run region calibration first.")
+                self._status(
+                    f"Region '{region_key}' not set — run region calibration first."
+                )
                 continue
 
-            save_path = os.path.join(TEMPLATE_DIR, f"{filename}.png")
-            self._status(
-                f"Capturing template '{tmpl_key}' from region '{region_key}'.\n"
-                "Switch to the game, position the indicator, then press Enter."
-            )
-            input("  [Calibration] Press Enter when the game is showing the correct state...")
+            self._status(_TEMPLATE_PROMPTS[tmpl_key])
+            input(f"  [Calibration] Press Enter when '{tmpl_key}' state is visible in game…")
 
+            save_path = os.path.join(TEMPLATE_DIR, f"{tmpl_key}.png")
             ok = vision.save_region_screenshot(region, save_path)
             if ok:
                 cfg["templates"][tmpl_key] = save_path
                 self._status(f"Template saved: {save_path}")
             else:
-                self._status(f"Failed to save template for {tmpl_key}.")
+                self._status(f"Failed to save template: {tmpl_key}")
 
         config.save(cfg)
         self._status("Template calibration complete.")
 
-    def preview_detection(self, state_key: str) -> None:
+    def preview_motion(self) -> None:
         """
-        Grab the configured region for *state_key* and run detection, printing
-        the result.  Useful for verifying thresholds without starting the loop.
+        Quick diagnostic: grab two frames from motion_sample 100 ms apart and
+        print the measured (dx, dy) and whether the camera appears still.
+        Useful for verifying optical_flow thresholds without starting the loop.
         """
+        import time
         cfg = config.load()
-        region_map = {
-            "bite": "bite_indicator",
-            "tired": "stamina_indicator",
-            "catch_complete": "catch_indicator",
-        }
-        region_key = region_map.get(state_key)
-        if not region_key:
-            self._status(f"Unknown state key: {state_key}")
+        region = cfg["regions"].get("motion_sample")
+        of_cfg = cfg["optical_flow"]
+
+        if region is None:
+            self._status("motion_sample region not configured.")
             return
 
-        region = cfg["regions"].get(region_key)
-        tmpl_path = cfg["templates"].get(state_key)
-        color_cfg = cfg["color_ranges"].get(state_key)
-        thresh = cfg["thresholds"].get(state_key, 0.80)
-        ratio = cfg["thresholds"].get("color_pixel_ratio", 0.05)
+        f1 = vision.grab_region(region)
+        time.sleep(0.1)
+        f2 = vision.grab_region(region)
 
-        detected, conf = vision.detect_state(region, tmpl_path, color_cfg, thresh, ratio)
+        direction, magnitude, is_tired = vision.detect_fight_direction(
+            f1, f2,
+            motion_threshold=of_cfg["motion_threshold"],
+            still_threshold=of_cfg["still_threshold"],
+            dominance_ratio=of_cfg["direction_dominance_ratio"],
+        )
         self._status(
-            f"Preview [{state_key}]: detected={detected}, confidence={conf:.3f}"
+            f"Motion preview: direction={direction}, magnitude={magnitude:.3f}, "
+            f"is_tired={is_tired}"
         )

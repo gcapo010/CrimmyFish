@@ -1,27 +1,44 @@
 # CrimmyFish — Crimson Desert Auto Fishing Assistant
 
-A screen-vision-only desktop automation tool for the single-player game **Crimson Desert**.  
-No memory injection, no packet manipulation, no anti-cheat bypass — only screenshots and normal OS input.
+Screen-vision-only desktop automation for the single-player game **Crimson Desert**.  
+No memory injection, no packet manipulation, no anti-cheat bypass — only screenshots and normal OS mouse/keyboard input.
+
+---
+
+## How the fishing loop works
+
+| Step | What happens in-game | What CrimmyFish does |
+|------|----------------------|----------------------|
+| Cast | Aim at water, hold LMB ~1 s then release | Holds left mouse button for a random 0.8–1.2 s |
+| Wait for bite | Fish bites → water splashes at float | Detects a motion burst (frame-diff spike) in the water region |
+| Hook | Character reacts, right-click to set hook | Sends a right mouse click |
+| Fight | Camera follows fish; move rod opposite direction | Measures camera-pan via `phaseCorrelate`; presses opposite WASD key |
+| Fish tired | Camera stops moving | Detects near-zero motion magnitude |
+| Reel | Hold Space | Holds Space until catch-complete detected |
+| Stow | Character holds fish; press F | Presses F, waits, then restarts loop |
 
 ---
 
 ## Requirements
 
-- Python 3.10+
-- Linux (X11 preferred) or Windows
-- Crimson Desert running in **windowed** or **borderless windowed** mode (fullscreen exclusive can block `mss`)
+- **Python 3.10+**
+- **Windows 11** (also works on Linux/X11)
+- Crimson Desert running in **windowed** or **borderless windowed** mode  
+  (fullscreen exclusive can block `mss` screen capture)
+- Screen resolution: **1920 × 1080** (default regions pre-configured for this)
 
 ---
 
 ## Installation
 
 ```bash
-# 1. Clone / copy this project
+# 1. Navigate to the project folder
 cd CrimmyFish
 
-# 2. Create a virtual environment (recommended)
+# 2. Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # Linux/macOS
 
 # 3. Install dependencies
 pip install -r requirements.txt
@@ -30,131 +47,125 @@ pip install -r requirements.txt
 python main.py
 ```
 
-### Linux / Wayland note
-
-`pynput` works natively on X11. On Wayland you may need to run the game and
-the tool under XWayland, or install `xdotool` and switch `input_controller.py`
-to shell out via `subprocess.run(["xdotool", ...])`.
-
 ---
 
-## First-time Setup & Calibration
+## First-time Calibration
 
-Calibration teaches the tool where to look on your screen and what each
-game state looks like.
+Calibration sets the screen regions CrimmyFish watches and captures reference
+screenshots for template matching.  Run it once before starting the loop.
 
 ### Step 1 — Select screen regions
 
-1. Start Crimson Desert and position the fishing UI on screen.
-2. Launch CrimmyFish (`python main.py`).
-3. Click **Calibrate**.
-4. A transparent overlay will appear for each region in turn.  
-   Drag a rectangle around the relevant UI element, then release the mouse.
+1. Start Crimson Desert, go to a fishing spot, and cast your line so the float is visible.
+2. Launch CrimmyFish and click **Calibrate**.
+3. A transparent overlay will appear for each region.  Drag a rectangle, then release.
 
 | Region | What to select |
 |--------|---------------|
-| **Bite indicator** | The small icon/flash that appears when a fish bites |
-| **Direction indicator** | The arrow or icon showing which way the fish is pulling |
-| **Stamina indicator** | The bar or icon that shows when the fish is tired |
-| **Catch indicator** | The prompt or banner that appears when a catch is complete |
+| **Bite indicator** | The water surface area where the float sits. Cover roughly where splashes appear. Avoid sky/horizon. |
+| **Motion sample** | A large centre-screen rectangle (roughly 40–60 % of screen). This is used to measure camera movement during the fight. Avoid UI chrome near the edges. |
+| **Catch indicator** | The lower-centre area showing your character model. Used to detect when your character is holding a caught fish. |
 
 ### Step 2 — Capture templates
 
-After regions are saved, the tool will ask you to capture a reference
-screenshot for each game state:
+After region selection, the calibration wizard will ask you to capture two templates:
 
+**Bite splash template**
 1. Switch to Crimson Desert.
-2. Trigger the relevant state (e.g. let a fish bite for the bite template).
-3. Switch back to the terminal and press **Enter**.
-4. The crop is saved to `templates/`.
+2. Get a fish to bite (or use a screenshot from a previous session where the splash is visible).
+3. Press **Enter** in the terminal when the splash is on screen.
 
-> **Tip:** You can recapture individual templates by editing `config.json`
-> to clear the `"templates"` paths and re-running calibration.
+**Catch complete template**
+1. Pull in a fish until your character is holding it in hand.
+2. Press **Enter** in the terminal.
+
+> Templates are saved to the `templates/` folder and paths are written to `config.json`.  
+> You can recapture any template by deleting its path in `config.json` and re-running calibration.
 
 ---
 
 ## Configuration (`config.json`)
 
-All settings live in `config.json` in the project root.
-
 ```jsonc
 {
-  "cast_key": "space",          // Key to cast the rod
-  "reel_key": "space",          // Key held to reel in
-  "hook_button": "left",        // Mouse button to hook the fish
+  "cast": {
+    "button": "left",
+    "hold_seconds_min": 0.8,   // Minimum hold time for casting
+    "hold_seconds_max": 1.2    // Maximum hold time (randomised each cast)
+  },
+  "hook_button": "right",      // Right-click to set the hook
+  "reel_key": "space",         // Key held to reel in
+  "post_catch_key": "f",       // Key pressed to stow the fish
+
   "direction_keys": {
-    "left":  "a",               // Counter key when fish pulls left
-    "right": "d",
-    "up":    "w",
-    "down":  "s"
+    "left":  "a",              // Fish going left  → camera pans left  → press D
+    "right": "d",              // Fish going right → camera pans right → press A
+    "up":    "w",              // Fish going up    → press S
+    "down":  "s"               // Fish going down  → press W
   },
-  "hotkeys": {
-    "emergency_stop": "f8",     // Immediately stop everything
-    "pause_resume":   "f7"      // Pause/resume without stopping
+
+  "optical_flow": {
+    "motion_threshold": 2.0,   // Min camera displacement (px/frame) to count as movement
+    "still_threshold":  0.6,   // Below this → fish is tired
+    "direction_dominance_ratio": 1.4  // One axis must be this × larger to pick a direction
   },
+
   "thresholds": {
-    "bite":              0.80,  // Template match confidence to count as bite
-    "direction":         0.75,  // Direction template confidence
-    "tired":             0.80,  // Tired-state confidence
-    "catch_complete":    0.80,  // Catch-complete confidence
-    "color_pixel_ratio": 0.05   // Fraction of region pixels that must match colour
-  },
-  "delays": {
-    "after_cast_min":      0.5, // Seconds to wait after casting (min)
-    "after_cast_max":      1.0, // Seconds to wait after casting (max)
-    "bite_poll_interval":  0.1, // How often to check for a bite
-    "fight_poll_interval": 0.05 // How often to check direction / tired state
-    // ... see config.json for all delay fields
-  },
-  "max_bite_wait_seconds": 60,  // Give up waiting for a bite after this long
-  "max_fight_seconds":    120   // Give up fighting after this long
+    "bite_template":    0.78,  // Template match confidence for bite
+    "bite_motion":      18.0,  // Mean frame-diff (0–255) to count as a splash
+    "catch_complete":   0.80   // Template confidence for catch-complete
+  }
 }
 ```
 
 ---
 
-## Improving Detection Accuracy
+## Tuning Detection
 
-### Template matching is unreliable
+### Bite never detected
 
-Template matching (`TM_CCOEFF_NORMED`) fails when:
-- The game resolution or UI scale changes
-- The indicator animates (changes size/colour between frames)
-- Screenshots are taken mid-animation
+The motion detector fires when the mean per-pixel brightness change in the
+water region exceeds `thresholds.bite_motion` (default 18.0 out of 255).
 
-**Fix:** Lower the threshold slightly (e.g. `0.70`) or switch to colour detection.
+- **Too many false positives** (fires on ripples): raise the value, e.g. `25.0`.
+- **Misses bites**: lower it, e.g. `12.0`.
+- Alternatively, enable template matching by capturing a `bite` template during
+  calibration — it will fire first if confidence exceeds `thresholds.bite_template`.
 
-### Colour threshold detection
+### Fight direction wrong or erratic
 
-Enable colour detection in `config.json`:
+`optical_flow.motion_threshold` and `direction_dominance_ratio` control when
+a direction is committed to.
 
-```json
-"color_ranges": {
-  "bite": {
-    "enabled": true,
-    "lower_hsv": [20, 100, 200],
-    "upper_hsv": [35, 255, 255]
-  }
-}
-```
+- If the bot presses keys when the fish is idle, **raise** `motion_threshold`.
+- If the bot frequently chooses no direction when the fish is clearly moving,
+  **lower** `motion_threshold` or **lower** `direction_dominance_ratio`.
+- Make the `motion_sample` region as large as practical — a larger region gives
+  a more stable `phaseCorrelate` result.
 
-To find the right HSV values:
-1. Take a screenshot of the indicator in its active state.
-2. Open it in GIMP or use the helper snippet below:
+### Fish treated as tired too early / too late
 
-```python
-import cv2, numpy as np
-img = cv2.imread("templates/bite.png")
-hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-print("H min/max:", hsv[:,:,0].min(), hsv[:,:,0].max())
-print("S min/max:", hsv[:,:,1].min(), hsv[:,:,1].max())
-print("V min/max:", hsv[:,:,2].min(), hsv[:,:,2].max())
-```
+Adjust `optical_flow.still_threshold`:
+- Tired detected too early (fish still fighting): **raise** it, e.g. `1.0`.
+- Tired never detected (loop times out): **lower** it, e.g. `0.3`.
 
-Typical indicators in Crimson Desert:
-- **Bite flash** — bright white/yellow glow → H: 15-35, S: 50-180, V: 200-255
-- **Stamina bar (full/tired)** — blue/grey vs. orange → adjust H accordingly
-- **Catch complete** — green tick or banner → H: 40-80
+### Catch complete never detected
+
+Make sure you captured the `catch_complete` template during calibration.  If the
+character's pose varies between catches, lower `thresholds.catch_complete` to
+`0.70–0.75`.  As a fallback you can increase `reel_poll_interval` and simply let
+the loop time out naturally after 45 seconds.
+
+---
+
+## Hotkeys
+
+| Key | Action |
+|-----|--------|
+| **F7** | Pause / Resume |
+| **F8** | Emergency Stop (instantly halts all input) |
+
+Both hotkeys work globally even when the game window is focused.
 
 ---
 
@@ -162,12 +173,11 @@ Typical indicators in Crimson Desert:
 
 | Problem | Solution |
 |---------|----------|
-| Nothing happens when I click Start | Check that calibration regions are set (`config.json` → `regions` must not be all `null`) |
-| Bite never detected | Lower `thresholds.bite` or enable colour detection |
-| Direction keys fire wrong | Re-capture direction templates while the fish is clearly pulling that way |
-| Input keys don't reach the game | Make sure Crimson Desert window is focused; try running both as the same user |
-| pynput keyboard error on Linux | Install `python3-xlib`: `sudo apt install python3-xlib` |
-| `mss` captures a black screen | Switch game to borderless windowed mode |
+| Nothing happens after clicking Start | Check that `config.json → regions` are set (not default values for a different resolution) |
+| `mss` captures a black screen | Switch Crimson Desert to borderless windowed mode |
+| Keys/clicks don't reach the game | Ensure the game is the active foreground window before starting |
+| `pynput` permission error on Windows | Run the terminal as the same user as the game (not administrator vs normal) |
+| phaseCorrelate always returns ~0 | The motion_sample region may be capturing a static UI overlay — move it to cover the game world |
 
 ---
 
@@ -175,23 +185,24 @@ Typical indicators in Crimson Desert:
 
 ```
 CrimmyFish/
-├── main.py               # Entry point, fishing state machine
-├── config.py             # Config load/save helpers
-├── vision.py             # Screenshot capture, template & colour detection
-├── input_controller.py   # Keyboard/mouse output + hotkey listener
-├── calibration.py        # Interactive region selector + template saver
-├── gui.py                # tkinter control panel
-├── logger.py             # Structured logging (file + GUI queue)
-├── config.json           # User settings
+├── main.py               Entry point + fishing state machine
+├── config.py             Config load/save with deep-merge defaults
+├── vision.py             Screen capture, template match, motion detection
+├── input_controller.py   Mouse hold/click, key tap/hold, hotkey listener
+├── calibration.py        Interactive region selector + template saver
+├── gui.py                tkinter dark-theme control panel
+├── logger.py             Rotating file log + GUI queue handler
+├── config.json           User settings (edit directly or via calibration)
 ├── requirements.txt
-├── templates/            # Saved reference screenshots (created on first calibration)
-└── crimmyfish.log        # Runtime log (auto-rotated)
+├── templates/            Reference screenshots (created during calibration)
+└── crimmyfish.log        Runtime log (auto-rotated, max 2 MB × 3 files)
 ```
 
 ---
 
 ## Safety & Fair Play
 
-- This tool only reads pixels and sends normal OS keyboard/mouse events.
-- It does **not** read or write game memory, modify game files, intercept network traffic, or bypass any protection system.
-- Use it only in single-player / offline sessions as intended.
+This tool only reads screen pixels and sends normal OS-level mouse and keyboard
+events — the same as a human operating the game.  It does **not** read or write
+game memory, modify game files, intercept network traffic, or bypass any
+protection mechanism.  Use it in single-player / offline sessions only.

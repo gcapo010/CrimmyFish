@@ -1,15 +1,27 @@
 """
 vision.py — Screen capture and computer-vision detection.
 
-Detection strategy (in priority order for each state):
-  1. Template matching — precise but requires a saved screenshot crop.
-  2. Color threshold  — fast fallback when the indicator is a solid-color UI element.
+Two detection modes are used depending on what the game exposes:
 
-Both methods return a (detected: bool, confidence: float) tuple so callers can
-log confidence and the GUI can display it.
+  A. Template / colour matching  — used for the bite splash and catch-complete state,
+     where a specific visual appears in a fixed screen region.
+
+  B. Camera motion (phase correlation) — used for the fight phase.
+     Crimson Desert has no visible direction HUD; instead the camera pans to follow
+     the fish.  cv2.phaseCorrelate compares two frames and returns the (dx, dy)
+     translation vector directly, which tells us which way the camera is moving.
+
+     Convention:
+       camera pans RIGHT  → dx negative  → fish going right → press A
+       camera pans LEFT   → dx positive  → fish going left  → press D
+       camera pans DOWN   → dy negative  → fish going down  → press S
+       camera pans UP     → dy positive  → fish going up    → press W
+
+     When the fish is tired the camera stops moving; phaseCorrelate magnitude ≈ 0.
 """
 
 import os
+import math
 from typing import Optional
 
 import cv2
@@ -18,8 +30,6 @@ import numpy as np
 
 import logger
 
-# Cached template images keyed by their config path so we don't re-read disk
-# on every poll iteration.
 _template_cache: dict[str, np.ndarray] = {}
 
 
@@ -28,25 +38,17 @@ _template_cache: dict[str, np.ndarray] = {}
 # ---------------------------------------------------------------------------
 
 def grab_region(region: Optional[dict]) -> Optional[np.ndarray]:
-    """
-    Capture a screen region and return a BGR numpy array.
-
-    region must be {"left": int, "top": int, "width": int, "height": int}
-    or None (in which case None is returned).
-    """
+    """Capture a screen region; return BGR array or None if region is None."""
     if region is None:
         return None
     with mss.mss() as sct:
         shot = sct.grab(region)
-    # mss returns BGRA; drop alpha channel
-    frame = np.array(shot)[:, :, :3]
-    return frame
+    return np.array(shot)[:, :, :3]
 
 
 def grab_full_screen() -> np.ndarray:
-    """Return a BGR screenshot of the primary monitor."""
     with mss.mss() as sct:
-        monitor = sct.monitors[1]  # monitors[0] is the virtual all-monitors rect
+        monitor = sct.monitors[1]
         shot = sct.grab(monitor)
     return np.array(shot)[:, :, :3]
 
@@ -56,7 +58,6 @@ def grab_full_screen() -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _load_template(path: str) -> Optional[np.ndarray]:
-    """Load and cache a grayscale template from disk."""
     if path in _template_cache:
         return _template_cache[path]
     if not os.path.exists(path):
@@ -75,38 +76,23 @@ def match_template(
     template_path: str,
     threshold: float = 0.80,
 ) -> tuple[bool, float]:
-    """
-    Run normalised cross-correlation template matching.
-
-    Returns (detected, best_confidence).
-    Converts the frame to grayscale internally so templates should be saved
-    as grayscale (or BGR — both work).
-    """
+    """Normalised cross-correlation template match. Returns (detected, confidence)."""
     if frame is None:
         return False, 0.0
-
     tmpl = _load_template(template_path)
     if tmpl is None:
         return False, 0.0
-
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-
-    # Guard: template must be smaller than the region
     if tmpl.shape[0] > gray.shape[0] or tmpl.shape[1] > gray.shape[1]:
-        logger.warning(
-            "Template (%s) is larger than the capture region — skipping match.",
-            template_path,
-        )
+        logger.warning("Template larger than capture region — skipping: %s", template_path)
         return False, 0.0
-
     result = cv2.matchTemplate(gray, tmpl, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, _ = cv2.minMaxLoc(result)
-    detected = max_val >= threshold
-    return detected, float(max_val)
+    return max_val >= threshold, float(max_val)
 
 
 # ---------------------------------------------------------------------------
-# Color threshold detection
+# Colour threshold detection
 # ---------------------------------------------------------------------------
 
 def detect_color(
@@ -116,105 +102,203 @@ def detect_color(
     pixel_ratio_threshold: float = 0.05,
 ) -> tuple[bool, float]:
     """
-    Detect whether enough pixels in *frame* fall within an HSV colour range.
-
-    pixel_ratio_threshold — fraction of total pixels that must match (0–1).
-    Returns (detected, ratio) where ratio is the actual matching pixel fraction.
-
-    Tip: use an HSV colour picker to find the right range for your game's UI.
-    For example, the bite-indicator glow in Crimson Desert is often a bright
-    white/yellow flash — HSV upper_s near 30, upper_v near 255 works well.
+    Returns (detected, ratio) where ratio is matching pixel fraction.
+    Enable this as a fallback when template matching is unreliable — e.g. the
+    bite flash is a bright white glow: lower_hsv=[0,0,200], upper_hsv=[180,30,255].
     """
     if frame is None:
         return False, 0.0
-
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lo = np.array(lower_hsv, dtype=np.uint8)
-    hi = np.array(upper_hsv, dtype=np.uint8)
-    mask = cv2.inRange(hsv, lo, hi)
+    mask = cv2.inRange(
+        hsv,
+        np.array(lower_hsv, dtype=np.uint8),
+        np.array(upper_hsv, dtype=np.uint8),
+    )
     ratio = float(np.count_nonzero(mask)) / float(mask.size)
-    return ratio >= pixel_ratio_threshold, ratio
+    conf = min(ratio / max(pixel_ratio_threshold, 1e-6), 1.0)
+    return ratio >= pixel_ratio_threshold, conf
 
 
 # ---------------------------------------------------------------------------
-# Direction detection — multi-template approach
+# Bite detection — motion burst in the water region
 # ---------------------------------------------------------------------------
 
-def detect_direction(
-    frame: np.ndarray,
-    templates: dict,   # {"left": path, "right": path, "up": path, "down": path}
-    threshold: float = 0.75,
-) -> tuple[Optional[str], float]:
-    """
-    Compare all direction templates against *frame* and return the best match.
-
-    Returns (direction_name_or_None, confidence).
-    direction_name will be one of "left", "right", "up", "down".
-    """
-    best_dir: Optional[str] = None
-    best_conf: float = 0.0
-
-    for direction, path in templates.items():
-        if not path:
-            continue
-        detected, conf = match_template(frame, path, threshold)
-        if detected and conf > best_conf:
-            best_dir = direction
-            best_conf = conf
-
-    return best_dir, best_conf
-
-
-# ---------------------------------------------------------------------------
-# Combined detector — tries template first, falls back to colour if enabled
-# ---------------------------------------------------------------------------
-
-def detect_state(
-    region: Optional[dict],
-    template_path: Optional[str],
-    color_cfg: Optional[dict],
-    template_threshold: float = 0.80,
-    color_pixel_ratio: float = 0.05,
+def detect_bite_motion(
+    frame_prev: np.ndarray,
+    frame_curr: np.ndarray,
+    motion_threshold: float = 18.0,
 ) -> tuple[bool, float]:
     """
-    Unified detector for a named game state (bite, tired, catch_complete).
+    Detect the bite splash by looking for a sudden brightness-change burst
+    between two consecutive frames of the water region.
 
-    Tries template matching first (if a template path is configured).
-    Falls back to colour detection if color_cfg["enabled"] is True.
-    Returns (detected, confidence).
+    The splash animation creates a large per-pixel difference compared to the
+    gently rippling idle water.  motion_threshold is the mean absolute difference
+    (0–255 scale) that must be exceeded.
+
+    Returns (detected, mean_diff).
+    """
+    if frame_prev is None or frame_curr is None:
+        return False, 0.0
+    gray_prev = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
+    gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
+    diff = cv2.absdiff(gray_prev, gray_curr)
+    mean_diff = float(diff.mean())
+    return mean_diff >= motion_threshold, mean_diff
+
+
+def detect_bite(
+    region: Optional[dict],
+    template_path: Optional[str],
+    prev_frame: Optional[np.ndarray],
+    color_cfg: Optional[dict],
+    template_threshold: float = 0.78,
+    motion_threshold: float = 18.0,
+    color_pixel_ratio: float = 0.04,
+) -> tuple[bool, float, np.ndarray]:
+    """
+    Unified bite detector.  Tries (in order):
+      1. Template match on current frame
+      2. Motion burst between prev_frame and current frame
+      3. Colour threshold on current frame (if enabled)
+
+    Returns (detected, confidence, current_frame).
+    current_frame is returned so the caller can pass it as prev_frame next iteration.
     """
     frame = grab_region(region)
     if frame is None:
-        return False, 0.0
+        return False, 0.0, prev_frame
 
-    # --- Template matching ---
+    # 1. Template
     if template_path:
         detected, conf = match_template(frame, template_path, template_threshold)
         if detected:
-            return True, conf
-        # If template was configured but didn't fire, still try colour fallback
+            return True, conf, frame
 
-    # --- Colour threshold fallback ---
+    # 2. Motion burst
+    if prev_frame is not None:
+        detected, mean_diff = detect_bite_motion(prev_frame, frame, motion_threshold)
+        if detected:
+            conf = min(mean_diff / max(motion_threshold, 1e-6), 1.0)
+            return True, conf, frame
+
+    # 3. Colour fallback
     if color_cfg and color_cfg.get("enabled"):
-        detected, ratio = detect_color(
+        detected, conf = detect_color(
             frame,
             color_cfg["lower_hsv"],
             color_cfg["upper_hsv"],
             color_pixel_ratio,
         )
-        # Express colour ratio as a 0–1 confidence analogue
-        conf = min(ratio / max(color_pixel_ratio, 1e-6), 1.0)
-        return detected, conf
+        if detected:
+            return True, conf, frame
 
+    return False, 0.0, frame
+
+
+# ---------------------------------------------------------------------------
+# Camera motion detection — fight phase
+# ---------------------------------------------------------------------------
+
+def _to_float32_gray(frame: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    return gray.astype(np.float32)
+
+
+def measure_camera_motion(
+    frame_prev: np.ndarray,
+    frame_curr: np.ndarray,
+) -> tuple[float, float]:
+    """
+    Use phase correlation to find the (dx, dy) translation between two frames.
+
+    Phase correlation is essentially an FFT-based normalised cross-correlation.
+    It returns the sub-pixel shift of frame_curr relative to frame_prev.
+    A large value means the camera is panning; near-zero means the camera is still.
+
+    Returns (dx, dy) in pixels.  Positive dx = world moved right = camera panned left.
+    """
+    f1 = _to_float32_gray(frame_prev)
+    f2 = _to_float32_gray(frame_curr)
+    # Hanning window reduces edge artefacts
+    win = cv2.createHanningWindow((f1.shape[1], f1.shape[0]), cv2.CV_32F)
+    (dx, dy), _ = cv2.phaseCorrelate(f1, f2, win)
+    return float(dx), float(dy)
+
+
+def detect_fight_direction(
+    frame_prev: np.ndarray,
+    frame_curr: np.ndarray,
+    motion_threshold: float = 2.0,
+    still_threshold: float = 0.6,
+    dominance_ratio: float = 1.4,
+) -> tuple[Optional[str], float, bool]:
+    """
+    Classify camera motion into a fish direction and detect the tired state.
+
+    Camera pan direction maps to fish movement (and therefore the counter key)
+    as follows — the world moves opposite to the camera pan:
+
+        dx > 0  (world right / camera left)  → fish going LEFT  → press D
+        dx < 0  (world left  / camera right) → fish going RIGHT → press A
+        dy > 0  (world down  / camera up)    → fish going UP    → press S
+        dy < 0  (world up    / camera down)  → fish going DOWN  → press W
+
+    Returns (direction_or_None, magnitude, is_tired).
+    is_tired is True when the camera is still (magnitude < still_threshold).
+    direction is one of "left", "right", "up", "down", or None (ambiguous/idle).
+    """
+    if frame_prev is None or frame_curr is None:
+        return None, 0.0, False
+
+    dx, dy = measure_camera_motion(frame_prev, frame_curr)
+    magnitude = math.sqrt(dx * dx + dy * dy)
+
+    if magnitude < still_threshold:
+        return None, magnitude, True  # Fish is tired
+
+    if magnitude < motion_threshold:
+        return None, magnitude, False  # Moving but too slow to classify yet
+
+    abs_x, abs_y = abs(dx), abs(dy)
+
+    # Only commit to a direction when one axis clearly dominates
+    if abs_x >= abs_y * dominance_ratio:
+        direction = "left" if dx > 0 else "right"
+    elif abs_y >= abs_x * dominance_ratio:
+        direction = "up" if dy > 0 else "down"
+    else:
+        direction = None  # Diagonal — wait for a clearer reading
+
+    return direction, magnitude, False
+
+
+# ---------------------------------------------------------------------------
+# Catch-complete detection
+# ---------------------------------------------------------------------------
+
+def detect_catch_complete(
+    region: Optional[dict],
+    template_path: Optional[str],
+    threshold: float = 0.80,
+) -> tuple[bool, float]:
+    """
+    Template match for the player holding the caught fish.
+    Returns (detected, confidence).
+    """
+    frame = grab_region(region)
+    if frame is None:
+        return False, 0.0
+    if template_path:
+        return match_template(frame, template_path, threshold)
     return False, 0.0
 
 
 # ---------------------------------------------------------------------------
-# Utility: save a region crop to disk (used by calibration)
+# Utility — save a region crop to disk (used by calibration)
 # ---------------------------------------------------------------------------
 
 def save_region_screenshot(region: dict, save_path: str) -> bool:
-    """Grab *region* and save it as a PNG template. Returns True on success."""
     frame = grab_region(region)
     if frame is None:
         logger.error("Could not capture region for saving.")
@@ -222,7 +306,6 @@ def save_region_screenshot(region: dict, save_path: str) -> bool:
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     ok = cv2.imwrite(save_path, frame)
     if ok:
-        # Invalidate cache so the new template is loaded fresh
         _template_cache.pop(save_path, None)
         logger.info("Saved template: %s", save_path)
     else:
