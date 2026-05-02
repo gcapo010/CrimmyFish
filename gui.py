@@ -323,9 +323,7 @@ class FishingGUI:
             relief=tk.FLAT, bd=0,
         )
         sb = tk.Scrollbar(cv, orient="vertical",
-                          command=self._log_text.yview,
-                          bg=_PANEL_BG, troughcolor=_WIN_BG,
-                          activebackground=_GOLD_MID)
+                          command=self._log_text.yview)
         self._log_text.configure(yscrollcommand=sb.set)
 
         # Place text and scrollbar inside the canvas, respecting the inner border
