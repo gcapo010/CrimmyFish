@@ -198,10 +198,9 @@ class SpriteButton(tk.Canvas):
         img = self._sprites.img(key)
         if img:
             self.create_image(0, 0, anchor="nw", image=img)
-        # Text colour: dark when on bright hover/press, light otherwise
-        tc = _WIN_BG if (pressed or self._hovered) else _TEXT
+        # Gold text is legible against every brightness variant of the dark gem fills
         self.create_text(_BTN_W//2, _BTN_H//2, text=self._text,
-                         fill=tc, font=("Georgia", 11, "bold"))
+                         fill=_GOLD_HI, font=("Georgia", 11, "bold"))
 
     def _set_hover(self, v):
         self._hovered = v
