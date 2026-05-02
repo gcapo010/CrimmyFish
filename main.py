@@ -143,22 +143,33 @@ class FishingLoop:
 
     def _wait_for_bite(self, cfg: dict, delays: dict) -> bool:
         """
-        Poll the bite_indicator region for a motion burst (water splash).
-        Optionally also tries template matching if a template is configured.
-        Returns True when a bite is detected, False on timeout.
+        Poll for a fish bite using two parallel detectors:
+
+        1. Camera-shift (primary) — phaseCorrelate on motion_sample.
+           Crimson Desert shifts the camera noticeably downward when a fish bites.
+           |dy| > bite_camera_dy threshold triggers this detector.
+
+        2. Motion burst (fallback) — frame-diff on bite_indicator.
+           Catches visible water-splash changes if camera shift is below threshold.
+
+        Template matching and colour threshold are also tried if configured.
+        Returns True on any detection, False on timeout.
         """
         self._status("Waiting for bite…")
         timeout = cfg.get("max_bite_wait_seconds", 90)
         deadline = time.monotonic() + timeout
         interval = delays["bite_poll_interval"]
 
-        thresholds = cfg["thresholds"]
-        region = cfg["regions"]["bite_indicator"]
-        tmpl = cfg["templates"].get("bite")
-        color_cfg = cfg["color_ranges"].get("bite")
+        thresholds   = cfg["thresholds"]
+        region_bite  = cfg["regions"].get("bite_indicator")
+        region_cam   = cfg["regions"].get("motion_sample")
+        tmpl         = cfg["templates"].get("bite")
+        color_cfg    = cfg["color_ranges"].get("bite")
+        dy_threshold = thresholds.get("bite_camera_dy", 3.0)
 
-        # Seed the previous frame for motion detection
-        prev_frame = vision.grab_region(region)
+        # Seed previous frames for both detectors
+        prev_bite = vision.grab_region(region_bite)
+        prev_cam  = vision.grab_region(region_cam)
 
         while time.monotonic() < deadline:
             if ic.is_stopped():
@@ -166,21 +177,32 @@ class FishingLoop:
             while ic.is_paused():
                 ic.safe_sleep(0.1)
 
-            detected, conf, prev_frame = vision.detect_bite(
-                region=region,
+            # ── Detector 1: camera downward shift ──────────────────────────
+            curr_cam = vision.grab_region(region_cam)
+            if curr_cam is not None and prev_cam is not None:
+                cam_hit, abs_dy = vision.detect_bite_camera_shift(
+                    prev_cam, curr_cam, dy_threshold=dy_threshold
+                )
+                self._gui.set_confidence(abs_dy / max(dy_threshold, 1e-6))
+                logger.debug("Bite cam-shift: dy=%.2f threshold=%.2f", abs_dy, dy_threshold)
+                if cam_hit:
+                    logger.info("Bite detected via camera shift! |dy|=%.2f", abs_dy)
+                    return True
+                prev_cam = curr_cam
+
+            # ── Detector 2: splash motion burst + template + colour ────────
+            detected, conf, prev_bite = vision.detect_bite(
+                region=region_bite,
                 template_path=tmpl,
-                prev_frame=prev_frame,
+                prev_frame=prev_bite,
                 color_cfg=color_cfg,
                 template_threshold=thresholds["bite_template"],
                 motion_threshold=thresholds["bite_motion"],
                 color_pixel_ratio=thresholds["color_pixel_ratio"],
             )
-
-            self._gui.set_confidence(conf)
-            logger.debug("Bite poll: detected=%s conf=%.3f", detected, conf)
-
             if detected:
-                logger.info("Bite detected! conf=%.3f", conf)
+                self._gui.set_confidence(conf)
+                logger.info("Bite detected via motion burst! conf=%.3f", conf)
                 return True
 
             ic.safe_sleep(interval)

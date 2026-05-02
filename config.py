@@ -43,6 +43,10 @@ _DEFAULTS: dict = {
         "bite_template": 0.78,
         # Mean per-pixel brightness change that counts as a motion burst (bite splash)
         "bite_motion": 18.0,
+        # Minimum |dy| from phaseCorrelate on the motion_sample region to count as a bite.
+        # Crimson Desert shifts the camera down noticeably when a fish bites (~3–6 px).
+        # Lower this if bites are missed; raise it if idle camera drift triggers false positives.
+        "bite_camera_dy": 3.0,
         "catch_complete": 0.80,
         "color_pixel_ratio": 0.04,
     },

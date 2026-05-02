@@ -147,6 +147,28 @@ def detect_bite_motion(
     return mean_diff >= motion_threshold, mean_diff
 
 
+def detect_bite_camera_shift(
+    frame_prev: np.ndarray,
+    frame_curr: np.ndarray,
+    dy_threshold: float = 3.0,
+) -> tuple[bool, float]:
+    """
+    Detect a downward camera shift that signals a fish bite in Crimson Desert.
+
+    When a fish bites, the camera jerks noticeably downward.  Phase correlation
+    on a large centre-screen region measures the inter-frame displacement;
+    |dy| exceeding dy_threshold (default 3 px) while the camera was previously
+    still is the trigger.
+
+    Returns (detected, abs_dy).
+    """
+    if frame_prev is None or frame_curr is None:
+        return False, 0.0
+    _, dy = measure_camera_motion(frame_prev, frame_curr)
+    abs_dy = abs(dy)
+    return abs_dy >= dy_threshold, abs_dy
+
+
 def detect_bite(
     region: Optional[dict],
     template_path: Optional[str],
