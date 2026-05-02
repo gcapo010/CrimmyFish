@@ -34,28 +34,26 @@ _BG_RGB    = (30, 30, 46)   # #1e1e2e as RGB tuple, must match _BG
 
 def _load_logo() -> Optional[ImageTk.PhotoImage]:
     """
-    Load assets/logo.png, replace the black background with the UI background
-    colour, resize to _LOGO_SIZE, and return a PhotoImage.
+    Load assets/logo.png and composite it onto the UI background colour so
+    tkinter never sees transparent pixels (which render as a checkerboard on
+    Windows).
 
-    We composite rather than use alpha so tkinter never sees transparent pixels
-    (which show as a checkerboard on Windows).
+    The PNG already carries a correct alpha channel — we use that directly
+    rather than trying to infer a mask from pixel brightness.
     """
     if not os.path.exists(_LOGO_PATH):
         return None
     try:
-        img = Image.open(_LOGO_PATH).convert("RGB")
+        img = Image.open(_LOGO_PATH).convert("RGBA")
 
-        # Build a mask: pixels brighter than threshold belong to the artwork;
-        # pixels at or below it are the black outer background.
-        gray  = img.convert("L")
-        mask  = gray.point(lambda v: 255 if v > 20 else 0)   # white = keep art
+        # Flatten onto a solid background that matches the window colour.
+        # This is the standard alpha-composite approach: every pixel becomes
+        #   result = alpha * art + (1 - alpha) * background
+        # so transparent areas become exactly _BG_RGB with no checkerboard.
+        canvas = Image.new("RGBA", img.size, _BG_RGB + (255,))
+        canvas = Image.alpha_composite(canvas, img)
 
-        # Fill a same-size canvas with the UI background colour, then paste the
-        # artwork on top using the mask — no transparency ever involved.
-        canvas = Image.new("RGB", img.size, _BG_RGB)
-        canvas.paste(img, mask=mask)
-
-        canvas = canvas.resize((_LOGO_SIZE, _LOGO_SIZE), Image.LANCZOS)
+        canvas = canvas.convert("RGB").resize((_LOGO_SIZE, _LOGO_SIZE), Image.LANCZOS)
         return ImageTk.PhotoImage(canvas)
     except Exception as exc:
         logger.warning("Could not load logo image: %s", exc)
