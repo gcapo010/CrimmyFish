@@ -28,29 +28,35 @@ _RED    = "#f38ba8"
 _PANEL  = "#313244"
 
 _LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
-_LOGO_SIZE = 200   # px — logo is square so one value covers both axes
+_LOGO_SIZE = 320   # px — logo is square so one value covers both axes
+_BG_RGB    = (30, 30, 46)   # #1e1e2e as RGB tuple, must match _BG
 
 
 def _load_logo() -> Optional[ImageTk.PhotoImage]:
     """
-    Load assets/logo.png, strip the black background so it blends into the
-    dark UI, resize to _LOGO_SIZE, and return a PhotoImage.
-    Returns None if the file is missing so the text fallback is used instead.
+    Load assets/logo.png, replace the black background with the UI background
+    colour, resize to _LOGO_SIZE, and return a PhotoImage.
+
+    We composite rather than use alpha so tkinter never sees transparent pixels
+    (which show as a checkerboard on Windows).
     """
     if not os.path.exists(_LOGO_PATH):
         return None
     try:
-        img = Image.open(_LOGO_PATH).convert("RGBA")
+        img = Image.open(_LOGO_PATH).convert("RGB")
 
-        # Make pure-black (and near-black) pixels fully transparent so the
-        # circular artwork sits cleanly on the dark background.
-        r, g, b, a = img.split()
-        # Pixels where all channels are below 15 → treat as background
-        mask = img.point(lambda p: 255 if p < 15 else 0).convert("L")
-        img.putalpha(mask.point(lambda p: 0 if p == 255 else 255))
+        # Build a mask: pixels brighter than threshold belong to the artwork;
+        # pixels at or below it are the black outer background.
+        gray  = img.convert("L")
+        mask  = gray.point(lambda v: 255 if v > 20 else 0)   # white = keep art
 
-        img = img.resize((_LOGO_SIZE, _LOGO_SIZE), Image.LANCZOS)
-        return ImageTk.PhotoImage(img)
+        # Fill a same-size canvas with the UI background colour, then paste the
+        # artwork on top using the mask — no transparency ever involved.
+        canvas = Image.new("RGB", img.size, _BG_RGB)
+        canvas.paste(img, mask=mask)
+
+        canvas = canvas.resize((_LOGO_SIZE, _LOGO_SIZE), Image.LANCZOS)
+        return ImageTk.PhotoImage(canvas)
     except Exception as exc:
         logger.warning("Could not load logo image: %s", exc)
         return None
@@ -75,6 +81,7 @@ class FishingGUI:
         self._root.title("CrimmyFish — Auto Fishing Assistant")
         self._root.configure(bg=_BG)
         self._root.resizable(False, False)
+        self._root.minsize(520, 600)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._status_var    = tk.StringVar(value="Idle")
