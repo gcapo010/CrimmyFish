@@ -1,152 +1,73 @@
 """
-calibration.py — Interactive region selector and template saver.
+calibration.py — One-shot guided fishing calibration.
 
-Opens a fullscreen transparent overlay so the user can drag a rectangle to
-select a screen region.  Coordinates are stored in config.json.
+Press Calibrate in the GUI and follow the log prompts.
+Stay in-game throughout — press F6 at each stage from inside Crimson Desert.
+No Alt-Tab or region-dragging needed.
 
-The three regions needed for Crimson Desert fishing:
+Stages captured with F6:
+  1. idle     — rod held, line NOT in water
+  2. waiting  — line sitting still in water, no bite yet
+  3. bite     — camera is tilting RIGHT NOW (fish is biting)
+  4. fight    — camera actively panning during the fight
+  5. catch    — golden fish-info panel visible bottom-right
 
-  bite_indicator   — The water area where the fishing line lands.
-                     Used for motion-burst (splash) detection.
-                     Select a rectangle covering the water surface where
-                     the float will sit.  Avoid the horizon and sky.
-
-  motion_sample    — The central portion of the screen used to measure
-                     camera pan direction during the fight phase.
-                     A large region gives more stable phase-correlation
-                     results.  Default covers the centre 50% of the screen.
-
-  catch_indicator  — The area showing the player character after a catch,
-                     used to detect when the fish is held in hand.
-                     Select the lower-centre area where the character model
-                     is visible.
+What gets written to config.json and templates/:
+  • regions (motion_sample, bite_indicator, catch_indicator)
+      derived automatically from screen dimensions
+  • thresholds.bite_scene_change
+      50 % of the measured waiting→bite scene difference
+  • templates/catch_complete.png
+      cropped from the catch frame (bottom-right panel area)
 """
 
 import os
 import threading
-import tkinter as tk
 from typing import Callable, Optional
 
+import cv2
+import numpy as np
 from pynput import keyboard as kb
 
 import config
 import logger
 import vision
 
+CAPTURE_KEY     = "f6"
+CAPTURE_TIMEOUT = 120   # seconds per step before skipping
 
-TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
+# ── Step definitions ───────────────────────────────────────────────────────
 
-_REGION_PROMPTS = {
-    "bite_indicator": (
-        "BITE INDICATOR — water surface where the float lands.\n"
-        "Drag a box covering the water area in front of the character.\n"
-        "Avoid sky/horizon.  Used for splash motion detection."
+_STEPS = [
+    (
+        "idle",
+        "IDLE — Stand still with your rod out, line NOT yet in the water.\n"
+        "Press F6 to capture the idle baseline.",
     ),
-    "motion_sample": (
-        "MOTION SAMPLE — centre screen region for camera-pan detection.\n"
-        "Drag a large box covering the centre 40–60% of the screen.\n"
-        "Avoid UI edges.  Used to track fight direction and tired state."
+    (
+        "waiting",
+        "WAITING FOR BITE — Cast your line and let the float settle.\n"
+        "Press F6 once the float is sitting still and you are waiting.",
     ),
-    "catch_indicator": (
-        "CATCH COMPLETE — area showing the player holding the fish.\n"
-        "Drag a box around the player character in the lower-centre area.\n"
-        "Used to detect when it is time to press F to stow the fish."
+    (
+        "bite",
+        "BITE — A fish is biting RIGHT NOW (camera is shifting down).\n"
+        "Press F6 the INSTANT the camera starts to tilt toward the water.",
     ),
-}
-
-_TEMPLATE_PROMPTS = {
-    "bite": (
-        "BITE SPLASH template.\n"
-        "Switch to the game and trigger a bite (or use a recording screenshot).\n"
-        "Press Enter when the water splash is visible."
+    (
+        "fight",
+        "FIGHTING — Camera is actively panning while fighting the fish.\n"
+        "Press F6 while the camera is moving (do NOT wait until fish is tired).",
     ),
-    "catch_complete": (
-        "CATCH COMPLETE template.\n"
-        "Switch to the game and pull in a fish so the character holds it.\n"
-        "Press Enter when the character is holding the fish in hand."
+    (
+        "catch",
+        "CATCH COMPLETE — Golden fish-info panel is visible bottom-right.\n"
+        "Press F6 when the panel is fully on screen.",
     ),
-}
-
-# Maps template key → region key (for capturing the crop)
-_TEMPLATE_REGION = {
-    "bite": "bite_indicator",
-    "catch_complete": "catch_indicator",
-}
+]
 
 
-# ---------------------------------------------------------------------------
-# Region selector overlay
-# ---------------------------------------------------------------------------
-
-class RegionSelector:
-    """Fullscreen drag-to-select overlay. Returns region dict or None on cancel."""
-
-    def __init__(self, prompt: str):
-        self._prompt = prompt
-        self._result: Optional[dict] = None
-
-    def select(self) -> Optional[dict]:
-        root = tk.Tk()
-        root.attributes("-fullscreen", True)
-        root.attributes("-alpha", 0.30)
-        root.attributes("-topmost", True)
-        root.configure(bg="black")
-        root.title("CrimmyFish — Region Selector")
-
-        canvas = tk.Canvas(root, cursor="crosshair", bg="black", highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            root,
-            text=self._prompt + "\n\nDrag a rectangle then release.  Escape to skip.",
-            fg="white",
-            bg="#1a1a2e",
-            font=("Helvetica", 13),
-            justify="center",
-            wraplength=900,
-        ).place(relx=0.5, rely=0.03, anchor="n")
-
-        start = [0, 0]
-        rect_id = [None]
-
-        def on_press(e):
-            start[0], start[1] = e.x_root, e.y_root
-            if rect_id[0]:
-                canvas.delete(rect_id[0])
-
-        def on_drag(e):
-            if rect_id[0]:
-                canvas.delete(rect_id[0])
-            x1 = start[0] - root.winfo_rootx()
-            y1 = start[1] - root.winfo_rooty()
-            rect_id[0] = canvas.create_rectangle(
-                x1, y1, e.x, e.y,
-                outline="#89b4fa", width=2, fill="#89b4fa", stipple="gray25",
-            )
-
-        def on_release(e):
-            x1, y1 = min(start[0], e.x_root), min(start[1], e.y_root)
-            x2, y2 = max(start[0], e.x_root), max(start[1], e.y_root)
-            w, h = x2 - x1, y2 - y1
-            if w > 5 and h > 5:
-                self._result = {"left": x1, "top": y1, "width": w, "height": h}
-            root.destroy()
-
-        canvas.bind("<ButtonPress-1>", on_press)
-        canvas.bind("<B1-Motion>", on_drag)
-        canvas.bind("<ButtonRelease-1>", on_release)
-        root.bind("<Escape>", lambda _: root.destroy())
-        root.mainloop()
-        return self._result
-
-
-# ---------------------------------------------------------------------------
-# Calibration manager
-# ---------------------------------------------------------------------------
-
-CAPTURE_HOTKEY = "f6"   # Global key pressed in-game to trigger a template capture
-CAPTURE_TIMEOUT = 60    # Seconds to wait before skipping if no key pressed
-
+# ── Manager ────────────────────────────────────────────────────────────────
 
 class CalibrationManager:
     def __init__(self, status_callback: Optional[Callable[[str], None]] = None):
@@ -156,30 +77,26 @@ class CalibrationManager:
         logger.info(msg)
         self._cb(msg)
 
-    def _wait_for_hotkey(self, prompt: str) -> bool:
-        """
-        Display *prompt* in the status bar, then block until the user presses
-        the global capture hotkey (F6) from anywhere — including while the game
-        window is in the foreground.
+    # ── F6 capture ─────────────────────────────────────────────────────────
 
-        Returns True if the hotkey was pressed within CAPTURE_TIMEOUT seconds,
-        False if the wait timed out or was interrupted.
-        """
+    def _capture_on_f6(self, step_name: str, prompt: str) -> Optional[np.ndarray]:
+        """Display prompt, block until F6 pressed in-game, return full-screen frame."""
         triggered = threading.Event()
 
         def on_press(key):
             try:
                 name = key.name if hasattr(key, "name") else key.char
-                if name and name.lower() == CAPTURE_HOTKEY:
+                if name and name.lower() == CAPTURE_KEY:
                     triggered.set()
-                    return False  # Stop this listener
+                    return False
             except AttributeError:
                 pass
 
         self._status(
-            f"{prompt}\n"
-            f"→ Switch to the game, get the state visible, then press "
-            f"{CAPTURE_HOTKEY.upper()} (you do NOT need to Alt-Tab back)."
+            f"[{step_name.upper()}]  {prompt}\n"
+            f"→ Switch to the game, get into position, then press "
+            f"{CAPTURE_KEY.upper()} (no Alt-Tab needed).  "
+            f"Timeout: {CAPTURE_TIMEOUT}s."
         )
 
         listener = kb.Listener(on_press=on_press, daemon=True)
@@ -189,65 +106,205 @@ class CalibrationManager:
 
         if not fired:
             self._status(
-                f"Timed out waiting for {CAPTURE_HOTKEY.upper()} — skipping this template."
+                f"Timed out waiting for {CAPTURE_KEY.upper()} on step "
+                f"'{step_name}' — skipping this stage."
             )
-        return fired
+            return None
 
-    def calibrate_regions(self) -> None:
-        """Walk the user through selecting each detection region."""
-        cfg = config.load()
-        for key, prompt in _REGION_PROMPTS.items():
-            self._status(f"Select region: {key}")
-            region = RegionSelector(prompt=prompt).select()
-            if region is None:
-                self._status(f"Skipped: {key}")
-                continue
-            cfg["regions"][key] = region
-            self._status(f"Saved {key}: {region}")
-        config.save(cfg)
-        self._status("Regions saved.")
+        frame = vision.grab_full_screen()
+        h, w = frame.shape[:2]
+        self._status(f"  ✓  {step_name}  ({w}×{h} px captured)")
+        return frame
 
-    def calibrate_templates(self, keys: Optional[list] = None) -> None:
+    # ── Public entry point ─────────────────────────────────────────────────
+
+    def run_full_calibration(self) -> None:
         """
-        Capture a reference screenshot for each template from the corresponding
-        configured region.  Call AFTER calibrate_regions.
+        Walk through every fishing stage once and derive all detection
+        parameters from the real captured frames.
         """
+        self._status("=== Guided Fishing Calibration ===")
+        self._status(
+            "Stay in-game.  Press F6 at each prompt.\n"
+            "Each step has a 2-minute window — skip any step by waiting it out.\n"
+            "Defaults are kept for any skipped step."
+        )
+
+        frames: dict[str, Optional[np.ndarray]] = {}
+        for key, prompt in _STEPS:
+            frames[key] = self._capture_on_f6(key, prompt)
+
+        self._derive_and_save(frames)
+
+    # ── Derivation ─────────────────────────────────────────────────────────
+
+    def _derive_and_save(self, frames: dict[str, Optional[np.ndarray]]) -> None:
+        self._status("Analysing captures — deriving thresholds and templates…")
         cfg = config.load()
-        os.makedirs(TEMPLATE_DIR, exist_ok=True)
-        targets = keys or list(_TEMPLATE_PROMPTS.keys())
 
-        for tmpl_key in targets:
-            region_key = _TEMPLATE_REGION.get(tmpl_key)
-            region = cfg["regions"].get(region_key)
-            if region is None:
-                self._status(
-                    f"Region '{region_key}' not set — run region calibration first."
-                )
-                continue
-
-            fired = self._wait_for_hotkey(_TEMPLATE_PROMPTS[tmpl_key])
-            if not fired:
-                continue
-
-            save_path = os.path.join(TEMPLATE_DIR, f"{tmpl_key}.png")
-            ok = vision.save_region_screenshot(region, save_path)
-            if ok:
-                cfg["templates"][tmpl_key] = save_path
-                self._status(f"Template saved: {save_path}")
-            else:
-                self._status(f"Failed to save template: {tmpl_key}")
+        self._auto_regions(cfg, frames)
+        self._derive_bite_threshold(cfg, frames)
+        self._save_catch_template(cfg, frames)
+        self._validate_fight(cfg, frames)
 
         config.save(cfg)
-        self._status("Template calibration complete.")
+        self._status(
+            "=== Calibration complete ===\n"
+            "config.json updated.  Ready to fish — press Start (F6)."
+        )
+
+    def _auto_regions(self, cfg: dict, frames: dict) -> None:
+        """
+        Set all three detection regions from screen dimensions.
+        No dragging needed — proportions match observed gameplay:
+          motion_sample   = centre 50%   (stable for phase-correlation)
+          bite_indicator  = upper-centre (horizon area most affected by bite tilt)
+          catch_indicator = bottom-right 40%×45% (golden fish-info panel)
+        """
+        ref = next((f for f in frames.values() if f is not None), None)
+        if ref is None:
+            self._status("No frames captured — regions unchanged.")
+            return
+        h, w = ref.shape[:2]
+
+        cfg["regions"]["motion_sample"] = {
+            "left": w // 4,       "top": h // 4,
+            "width": w // 2,      "height": h // 2,
+        }
+        cfg["regions"]["bite_indicator"] = {
+            "left": w // 4,       "top": h // 6,
+            "width": w // 2,      "height": h // 2,
+        }
+        cfg["regions"]["catch_indicator"] = {
+            "left":  int(w * 0.60), "top":    int(h * 0.55),
+            "width": int(w * 0.40), "height": int(h * 0.45),
+        }
+        self._status(
+            f"Regions auto-set for {w}×{h} screen:\n"
+            f"  motion_sample:   centre 50%\n"
+            f"  bite_indicator:  upper-centre 50%\n"
+            f"  catch_indicator: bottom-right 40%×45%"
+        )
+
+    def _derive_bite_threshold(self, cfg: dict, frames: dict) -> None:
+        """
+        Measure mean-abs-diff between 'waiting' and 'bite' frames on the
+        motion_sample region, then set bite_scene_change = 50% of that value.
+
+        50% keeps the threshold well above idle noise (~1–5) while staying
+        safely below the actual bite magnitude (~25–60).
+        """
+        w_frame = frames.get("waiting")
+        b_frame = frames.get("bite")
+        if w_frame is None or b_frame is None:
+            self._status(
+                "Cannot derive bite threshold — 'waiting' or 'bite' frame missing.\n"
+                f"  Keeping current value: "
+                f"{cfg['thresholds'].get('bite_scene_change', 25.0)}"
+            )
+            return
+
+        r  = cfg["regions"]["motion_sample"]
+        x1 = r["left"];  y1 = r["top"]
+        x2 = min(x1 + r["width"],  w_frame.shape[1])
+        y2 = min(y1 + r["height"], w_frame.shape[0])
+        cw = w_frame[y1:y2, x1:x2]
+        cb = b_frame[y1:y2, x1:x2]
+
+        if cw.size == 0 or cb.size == 0:
+            self._status("motion_sample crop is empty — skipping bite threshold.")
+            return
+
+        g1   = cv2.cvtColor(cw, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g2   = cv2.cvtColor(cb, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        diff = float(np.abs(g1 - g2).mean())
+
+        # Report idle noise level for context
+        idle_frame = frames.get("idle")
+        idle_noise = 0.0
+        if idle_frame is not None:
+            ci = idle_frame[y1:y2, x1:x2]
+            if ci.size > 0:
+                g_i = cv2.cvtColor(ci, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                g_w = cv2.cvtColor(cw, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                idle_noise = float(np.abs(g_i - g_w).mean())
+
+        threshold = max(round(diff * 0.50, 1), 8.0)
+        cfg["thresholds"]["bite_scene_change"] = threshold
+        self._status(
+            f"Bite scene-change threshold:\n"
+            f"  idle baseline diff = {idle_noise:.1f}\n"
+            f"  waiting→bite diff  = {diff:.1f}\n"
+            f"  threshold set to   = {threshold:.1f}  (50% of bite diff)"
+        )
+
+    def _save_catch_template(self, cfg: dict, frames: dict) -> None:
+        """Crop the catch_indicator region from the catch frame and save as template."""
+        catch = frames.get("catch")
+        if catch is None:
+            self._status("Catch frame not captured — template unchanged.")
+            return
+
+        tmpl_dir = os.path.join(os.path.dirname(__file__), "templates")
+        os.makedirs(tmpl_dir, exist_ok=True)
+
+        r    = cfg["regions"]["catch_indicator"]
+        h, w = catch.shape[:2]
+        x1   = r["left"];  y1 = r["top"]
+        x2   = min(x1 + r["width"], w)
+        y2   = min(y1 + r["height"], h)
+        crop = catch[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            self._status("Catch crop region is empty — template not saved.")
+            return
+
+        path = os.path.join(tmpl_dir, "catch_complete.png")
+        cv2.imwrite(path, crop)
+        cfg["templates"]["catch_complete"] = path
+        self._status(
+            f"Catch template saved: {path}\n"
+            f"  ({crop.shape[1]}×{crop.shape[0]} px)"
+        )
+
+    def _validate_fight(self, cfg: dict, frames: dict) -> None:
+        """
+        Run phaseCorrelate between idle and fight frames to confirm the
+        motion_sample region gives usable direction signals during the fight.
+        """
+        idle  = frames.get("idle")
+        fight = frames.get("fight")
+        if idle is None or fight is None:
+            return
+
+        r    = cfg["regions"]["motion_sample"]
+        h, w = idle.shape[:2]
+        x1   = r["left"];  y1 = r["top"]
+        x2   = min(x1 + r["width"], w)
+        y2   = min(y1 + r["height"], h)
+        ci   = idle[y1:y2, x1:x2]
+        cf   = fight[y1:y2, x1:x2]
+
+        if ci.size == 0 or cf.size == 0:
+            return
+
+        dx, dy = vision.measure_camera_motion(ci, cf)
+        mag    = float(np.sqrt(dx * dx + dy * dy))
+        mt     = cfg["optical_flow"]["motion_threshold"]
+        ok     = mag > mt
+        self._status(
+            f"Fight motion check:\n"
+            f"  dx={dx:.2f}  dy={dy:.2f}  magnitude={mag:.2f}\n"
+            f"  motion_threshold={mt}  →  "
+            f"{'OK' if ok else f'WARNING: mag too low — lower motion_threshold in config.json'}"
+        )
+
+    # ── Diagnostic ─────────────────────────────────────────────────────────
 
     def preview_motion(self) -> None:
-        """
-        Quick diagnostic: grab two frames from motion_sample 100 ms apart and
-        print the measured (dx, dy) and whether the camera appears still.
-        Useful for verifying optical_flow thresholds without starting the loop.
-        """
+        """Grab two frames 100 ms apart and report camera motion — useful for tuning."""
         import time
-        cfg = config.load()
+        cfg    = config.load()
         region = cfg["regions"].get("motion_sample")
         of_cfg = cfg["optical_flow"]
 
@@ -266,6 +323,6 @@ class CalibrationManager:
             dominance_ratio=of_cfg["direction_dominance_ratio"],
         )
         self._status(
-            f"Motion preview: direction={direction}, magnitude={magnitude:.3f}, "
-            f"is_tired={is_tired}"
+            f"Motion preview: direction={direction}  "
+            f"magnitude={magnitude:.3f}  is_tired={is_tired}"
         )

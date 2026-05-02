@@ -385,12 +385,10 @@ def main() -> None:
 
     def on_calibrate():
         def _run():
-            mgr = calibration.CalibrationManager(status_callback=lambda m: gui.set_status(m))
-            gui.set_status("Calibrating regions…")
-            mgr.calibrate_regions()
-            gui.set_status("Regions done — capturing templates…")
-            mgr.calibrate_templates()
-            gui.set_status("Calibration complete.")
+            mgr = calibration.CalibrationManager(
+                status_callback=lambda m: gui.set_status(m)
+            )
+            mgr.run_full_calibration()
 
         threading.Thread(target=_run, daemon=True).start()
 
