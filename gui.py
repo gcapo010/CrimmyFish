@@ -11,19 +11,49 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import ttk
 from typing import Callable, Optional
+
+from PIL import Image, ImageTk
 
 import logger
 
 # Colour palette
-_BG = "#1e1e2e"
-_FG = "#cdd6f4"
+_BG     = "#1e1e2e"
+_FG     = "#cdd6f4"
 _ACCENT = "#89b4fa"
-_GREEN = "#a6e3a1"
+_GREEN  = "#a6e3a1"
 _YELLOW = "#f9e2af"
-_RED = "#f38ba8"
-_PANEL = "#313244"
+_RED    = "#f38ba8"
+_PANEL  = "#313244"
+
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
+_LOGO_SIZE = 200   # px — logo is square so one value covers both axes
+
+
+def _load_logo() -> Optional[ImageTk.PhotoImage]:
+    """
+    Load assets/logo.png, strip the black background so it blends into the
+    dark UI, resize to _LOGO_SIZE, and return a PhotoImage.
+    Returns None if the file is missing so the text fallback is used instead.
+    """
+    if not os.path.exists(_LOGO_PATH):
+        return None
+    try:
+        img = Image.open(_LOGO_PATH).convert("RGBA")
+
+        # Make pure-black (and near-black) pixels fully transparent so the
+        # circular artwork sits cleanly on the dark background.
+        r, g, b, a = img.split()
+        # Pixels where all channels are below 15 → treat as background
+        mask = img.point(lambda p: 255 if p < 15 else 0).convert("L")
+        img.putalpha(mask.point(lambda p: 0 if p == 255 else 255))
+
+        img = img.resize((_LOGO_SIZE, _LOGO_SIZE), Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except Exception as exc:
+        logger.warning("Could not load logo image: %s", exc)
+        return None
 
 
 class FishingGUI:
@@ -36,9 +66,9 @@ class FishingGUI:
         on_pause: Callable,
         on_calibrate: Callable,
     ):
-        self._on_start = on_start
-        self._on_stop = on_stop
-        self._on_pause = on_pause
+        self._on_start     = on_start
+        self._on_stop      = on_stop
+        self._on_pause     = on_pause
         self._on_calibrate = on_calibrate
 
         self._root = tk.Tk()
@@ -47,12 +77,13 @@ class FishingGUI:
         self._root.resizable(False, False)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._status_var = tk.StringVar(value="Idle")
+        self._status_var    = tk.StringVar(value="Idle")
         self._confidence_var = tk.StringVar(value="—")
         self._loop_count_var = tk.StringVar(value="0")
-        self._paused_var = tk.BooleanVar(value=False)
 
         self._log_queue = logger.get_gui_queue()
+        self._logo_img: Optional[ImageTk.PhotoImage] = None  # kept alive by reference
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -61,66 +92,67 @@ class FishingGUI:
 
     def _build_ui(self) -> None:
         root = self._root
-        pad = {"padx": 10, "pady": 6}
 
-        # Title bar
-        title_frame = tk.Frame(root, bg=_ACCENT, height=4)
-        title_frame.pack(fill=tk.X)
+        # Thin accent bar at the very top
+        tk.Frame(root, bg=_ACCENT, height=4).pack(fill=tk.X)
 
-        title_lbl = tk.Label(
-            root,
-            text="  CrimmyFish  ",
-            bg=_BG,
-            fg=_ACCENT,
-            font=tkfont.Font(family="Helvetica", size=18, weight="bold"),
-        )
-        title_lbl.pack(pady=(12, 2))
+        # ---- Header: logo image or text fallback ----
+        self._logo_img = _load_logo()
+        if self._logo_img:
+            tk.Label(
+                root,
+                image=self._logo_img,
+                bg=_BG,
+                bd=0,
+            ).pack(pady=(14, 0))
+        else:
+            # Fallback when assets/logo.png is absent
+            tk.Label(
+                root,
+                text="CrimmyFish",
+                bg=_BG,
+                fg=_ACCENT,
+                font=tkfont.Font(family="Helvetica", size=20, weight="bold"),
+            ).pack(pady=(14, 2))
+            tk.Label(
+                root,
+                text="Crimson Desert Auto Fishing Assistant",
+                bg=_BG,
+                fg=_FG,
+                font=tkfont.Font(family="Helvetica", size=10),
+            ).pack(pady=(0, 10))
 
-        sub_lbl = tk.Label(
-            root,
-            text="Crimson Desert Auto Fishing Assistant",
-            bg=_BG,
-            fg=_FG,
-            font=tkfont.Font(family="Helvetica", size=10),
-        )
-        sub_lbl.pack(pady=(0, 10))
+        ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=10, pady=(10, 0))
 
-        ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=10)
-
-        # Status panel
-        status_frame = tk.Frame(root, bg=_PANEL, relief=tk.FLAT, bd=0)
+        # ---- Status panel ----
+        status_frame = tk.Frame(root, bg=_PANEL)
         status_frame.pack(fill=tk.X, padx=10, pady=8)
 
-        self._make_stat_row(status_frame, "Status:", self._status_var, row=0)
-        self._make_stat_row(status_frame, "Confidence:", self._confidence_var, row=1)
+        self._make_stat_row(status_frame, "Status:",      self._status_var,     row=0)
+        self._make_stat_row(status_frame, "Confidence:",  self._confidence_var, row=1)
         self._make_stat_row(status_frame, "Fish caught:", self._loop_count_var, row=2)
 
         ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=10)
 
-        # Control buttons
+        # ---- Control buttons ----
         btn_frame = tk.Frame(root, bg=_BG)
         btn_frame.pack(pady=8)
 
-        self._start_btn = self._make_btn(
-            btn_frame, "Start (F6)", _GREEN, self._on_start, col=0
-        )
-        self._stop_btn = self._make_btn(
-            btn_frame, "Stop (F8)", _RED, self._on_stop, col=1
-        )
+        self._make_btn(btn_frame, "Start (F6)",  _GREEN,  self._on_start,      col=0)
+        self._make_btn(btn_frame, "Stop (F8)",   _RED,    self._on_stop,       col=1)
         self._pause_btn = self._make_btn(
             btn_frame, "Pause (F7)", _YELLOW, self._toggle_pause, col=2
         )
-        self._calib_btn = self._make_btn(
-            btn_frame, "Calibrate", _ACCENT, self._on_calibrate, col=3
-        )
+        self._make_btn(btn_frame, "Calibrate",   _ACCENT, self._on_calibrate,  col=3)
 
-        # Log viewer
+        # ---- Log viewer ----
         log_frame = tk.Frame(root, bg=_BG)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 10))
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 6))
 
-        log_label = tk.Label(log_frame, text="Log", bg=_BG, fg=_ACCENT,
-                             font=tkfont.Font(family="Helvetica", size=9, weight="bold"))
-        log_label.pack(anchor="w")
+        tk.Label(
+            log_frame, text="Log", bg=_BG, fg=_ACCENT,
+            font=tkfont.Font(family="Helvetica", size=9, weight="bold"),
+        ).pack(anchor="w")
 
         self._log_text = tk.Text(
             log_frame,
@@ -137,30 +169,34 @@ class FishingGUI:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self._log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Hotkey reminder
-        hint = tk.Label(
+        # ---- Hotkey hint ----
+        tk.Label(
             root,
             text="F6 Start  |  F7 Pause  |  F8 Emergency Stop",
             bg=_BG,
             fg="#585b70",
             font=tkfont.Font(family="Helvetica", size=8),
-        )
-        hint.pack(pady=(0, 8))
+        ).pack(pady=(2, 8))
 
-        # Start log polling
         self._poll_log()
 
-    def _make_stat_row(self, parent, label: str, var: tk.StringVar, row: int) -> None:
-        tk.Label(parent, text=label, bg=_PANEL, fg="#7f849c",
-                 font=tkfont.Font(family="Helvetica", size=9)).grid(
-            row=row, column=0, sticky="w", padx=8, pady=2
-        )
-        tk.Label(parent, textvariable=var, bg=_PANEL, fg=_FG,
-                 font=tkfont.Font(family="Helvetica", size=9, weight="bold")).grid(
-            row=row, column=1, sticky="w", padx=4, pady=2
-        )
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def _make_btn(self, parent, text: str, color: str, cmd: Callable, col: int) -> tk.Button:
+    def _make_stat_row(self, parent, label: str, var: tk.StringVar, row: int) -> None:
+        tk.Label(
+            parent, text=label, bg=_PANEL, fg="#7f849c",
+            font=tkfont.Font(family="Helvetica", size=9),
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=2)
+        tk.Label(
+            parent, textvariable=var, bg=_PANEL, fg=_FG,
+            font=tkfont.Font(family="Helvetica", size=9, weight="bold"),
+        ).grid(row=row, column=1, sticky="w", padx=4, pady=2)
+
+    def _make_btn(
+        self, parent, text: str, color: str, cmd: Callable, col: int
+    ) -> tk.Button:
         btn = tk.Button(
             parent,
             text=text,
@@ -183,7 +219,6 @@ class FishingGUI:
     # ------------------------------------------------------------------
 
     def _poll_log(self) -> None:
-        """Drain the logger queue and append messages to the Text widget."""
         try:
             while True:
                 msg = self._log_queue.get_nowait()
@@ -196,7 +231,7 @@ class FishingGUI:
         self._root.after(100, self._poll_log)
 
     # ------------------------------------------------------------------
-    # Button handlers
+    # Button / window handlers
     # ------------------------------------------------------------------
 
     def _toggle_pause(self) -> None:
@@ -207,7 +242,7 @@ class FishingGUI:
         self._root.destroy()
 
     # ------------------------------------------------------------------
-    # Public update methods (called from loop thread via root.after)
+    # Public update methods (called from the loop thread via root.after)
     # ------------------------------------------------------------------
 
     def set_status(self, text: str) -> None:
