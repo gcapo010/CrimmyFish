@@ -14,7 +14,7 @@ from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Callable, Optional
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageChops, ImageTk
 
 import logger
 
@@ -28,32 +28,43 @@ _RED    = "#f38ba8"
 _PANEL  = "#313244"
 
 _LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
-_LOGO_SIZE = 320   # px — logo is square so one value covers both axes
+_LOGO_SIZE = 1024  # display at native resolution
 _BG_RGB    = (30, 30, 46)   # #1e1e2e as RGB tuple, must match _BG
+
+# Any pixel whose brightest channel is at or below this value is treated as
+# the solid-black background and replaced with the UI colour.
+_BLACK_THRESHOLD = 12
 
 
 def _load_logo() -> Optional[ImageTk.PhotoImage]:
     """
-    Load assets/logo.png and composite it onto the UI background colour so
-    tkinter never sees transparent pixels (which render as a checkerboard on
-    Windows).
+    Load assets/logo.png (solid black background, no real alpha) and replace
+    the black corners with the UI background colour so the circular artwork
+    blends seamlessly into the dark window.
 
-    The PNG already carries a correct alpha channel — we use that directly
-    rather than trying to infer a mask from pixel brightness.
+    Strategy: take the per-pixel maximum across R, G, B channels to get a
+    single-channel brightness map. Pixels at or below _BLACK_THRESHOLD are
+    pure background; everything above belongs to the artwork.  We use that
+    as a paste mask so the result is a flat RGB image — no transparency, no
+    checkerboard.
     """
     if not os.path.exists(_LOGO_PATH):
         return None
     try:
-        img = Image.open(_LOGO_PATH).convert("RGBA")
+        img = Image.open(_LOGO_PATH).convert("RGB")
 
-        # Flatten onto a solid background that matches the window colour.
-        # This is the standard alpha-composite approach: every pixel becomes
-        #   result = alpha * art + (1 - alpha) * background
-        # so transparent areas become exactly _BG_RGB with no checkerboard.
-        canvas = Image.new("RGBA", img.size, _BG_RGB + (255,))
-        canvas = Image.alpha_composite(canvas, img)
+        r, g, b = img.split()
+        # max of all three channels → single brightness mask
+        max_channel = ImageChops.lighter(ImageChops.lighter(r, g), b)
+        # binary: 255 = artwork pixel, 0 = black background pixel
+        art_mask = max_channel.point(lambda v: 255 if v > _BLACK_THRESHOLD else 0)
 
-        canvas = canvas.convert("RGB").resize((_LOGO_SIZE, _LOGO_SIZE), Image.LANCZOS)
+        canvas = Image.new("RGB", img.size, _BG_RGB)
+        canvas.paste(img, mask=art_mask)
+
+        # Keep native resolution; only resize if the image is smaller than target
+        if canvas.width != _LOGO_SIZE or canvas.height != _LOGO_SIZE:
+            canvas = canvas.resize((_LOGO_SIZE, _LOGO_SIZE), Image.LANCZOS)
         return ImageTk.PhotoImage(canvas)
     except Exception as exc:
         logger.warning("Could not load logo image: %s", exc)
@@ -79,7 +90,7 @@ class FishingGUI:
         self._root.title("CrimmyFish — Auto Fishing Assistant")
         self._root.configure(bg=_BG)
         self._root.resizable(False, False)
-        self._root.minsize(520, 600)
+        self._root.minsize(1080, 900)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._status_var    = tk.StringVar(value="Idle")
