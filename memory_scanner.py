@@ -9,16 +9,16 @@ of all readable/writable game memory at each fishing phase, then finds addresses
 whose value changes at every transition and whose value is a small integer
 (consistent with a state-machine enum).
 
-Results (address + value→state map) are written to config.json.
-The bot then reads memory directly instead of using CV.
-
 How it works (same algorithm as Cheat Engine):
   1. Snapshot all R/W memory (~hundreds of MB of heap/data pages).
   2. At each state transition, re-read every region and keep only
      addresses whose 4-byte int value changed.
   3. After all stages, the surviving candidates changed at EVERY transition.
-  4. Filter to small non-negative integers (0–64) — the likely enum range.
-  5. Rank by number of distinct values across stages; save the best hit.
+  4. Filter to small non-negative integers (0–16) — the likely enum range.
+  5. Require ALL stage values to be distinct — a real enum has a unique int per state.
+  6. A final "back to idle" stage confirms the variable actually resets.
+  7. Stability check — re-read top candidates; discard any that fluctuate.
+  8. Interactive: show top candidates; you choose the right one.
 """
 
 import ctypes
@@ -48,12 +48,29 @@ MAX_REGION_BYTES = 64 * 1024 * 1024   # 64 MB
 CAPTURE_KEY     = "f6"
 CAPTURE_TIMEOUT = 180   # seconds per stage
 
+# Tightest plausible range for a fishing state enum.
+# Game state machines almost never exceed 16 states.
+STATE_RANGE_LO = 0
+STATE_RANGE_HI = 16
+
+# How many times to re-read each candidate to verify it's stable.
+STABILITY_READS  = 8
+STABILITY_DELAY  = 0.05   # seconds between reads
+
 STAGES = [
-    ("idle",    "IDLE — Rod out, line NOT in water.  Capture the resting baseline."),
-    ("waiting", "WAITING FOR BITE — Line in water, float sitting still."),
-    ("bite",    "BITE — Camera is shifting down RIGHT NOW.  Press F6 immediately."),
-    ("fight",   "FIGHTING — Camera actively panning while fish pulls."),
-    ("caught",  "CAUGHT — Golden fish-info panel is visible."),
+    ("idle",
+     "IDLE — Rod out, line NOT in water.  Capture the resting baseline."),
+    ("waiting",
+     "WAITING FOR BITE — Line is in the water, float sitting still."),
+    ("bite",
+     "BITE — Camera is shifting down RIGHT NOW.  Press F6 immediately."),
+    ("fight",
+     "FIGHTING — Camera actively panning while fish pulls."),
+    ("caught",
+     "CAUGHT — Golden fish-info panel is visible."),
+    ("idle_return",
+     "BACK TO IDLE — Fish stowed, rod at rest again.\n"
+     "  (This confirms the address resets — it's the most important step.)"),
 ]
 
 DEFAULT_PROCESS = "CrimsonDesert.exe"
@@ -112,30 +129,26 @@ def _read_region(handle: int, base: int, size: int) -> Optional[np.ndarray]:
     return None
 
 
+def _read_int32(handle: int, addr: int) -> Optional[int]:
+    buf = ctypes.create_string_buffer(4)
+    n   = ctypes.c_size_t(0)
+    if _RPM(handle, ctypes.c_void_p(addr), buf, 4, ctypes.byref(n)) and n.value == 4:
+        return struct.unpack_from("<i", buf.raw)[0]
+    return None
+
+
 # ── Snapshot-based scanner ─────────────────────────────────────────────────
 
 class MemScanner:
-    """
-    Snapshot-based memory scanner operating on 4-byte aligned int32 values.
-
-    workflow:
-        scanner.snapshot()           # baseline
-        # ... state changes in game ...
-        scanner.diff_changed()       # keep only addresses whose value changed
-        scanner.filter_range(0, 64)  # keep only small ints (state enums)
-    """
+    """Snapshot-based memory scanner operating on 4-byte aligned int32 values."""
 
     def __init__(self, handle: int):
         self._handle = handle
-        # {base_addr: np.ndarray[int32]}
         self._snap: dict[int, np.ndarray] = {}
-        # {addr: current_int32_value} — None means "all addresses are candidates"
         self._cands: Optional[dict[int, int]] = None
 
-    # ── Snapshot ──────────────────────────────────────────────────────────
-
     def snapshot(self) -> int:
-        """Take a full snapshot of all R/W regions.  Returns total MB captured."""
+        """Take a full snapshot.  Returns total MB captured."""
         self._snap.clear()
         total_ints = 0
         for base, size in _enum_rw_regions(self._handle):
@@ -148,14 +161,8 @@ class MemScanner:
               f"{total_ints:,} int32 values)")
         return mb
 
-    # ── Diff ──────────────────────────────────────────────────────────────
-
     def diff_changed(self) -> int:
-        """
-        Re-read all regions.  Keep candidates whose int32 value has changed
-        since the last snapshot.  Update internal snapshot.
-        Returns number of surviving candidates.
-        """
+        """Keep candidates whose int32 value changed since the last snapshot."""
         new_cands: dict[int, int] = {}
         new_snap:  dict[int, np.ndarray] = {}
 
@@ -178,8 +185,6 @@ class MemScanner:
         print(f"    Candidates after diff: {len(new_cands):,}")
         return len(new_cands)
 
-    # ── Filters ───────────────────────────────────────────────────────────
-
     def filter_range(self, lo: int, hi: int) -> int:
         """Discard candidates whose current value is outside [lo, hi]."""
         if self._cands is None:
@@ -188,16 +193,13 @@ class MemScanner:
         print(f"    After range filter [{lo}–{hi}]: {len(self._cands):,}")
         return len(self._cands)
 
-    # ── Accessors ─────────────────────────────────────────────────────────
+    def read_current(self, addr: int) -> Optional[int]:
+        """Re-read a single address from the live process."""
+        return _read_int32(self._handle, addr)
 
     def current_values(self) -> dict[int, int]:
         """Return {addr: current_int32} for all surviving candidates."""
-        if not self._cands:
-            return {}
-        result = {}
-        for addr, val in self._cands.items():
-            result[addr] = val
-        return result
+        return dict(self._cands) if self._cands else {}
 
     @property
     def count(self) -> int:
@@ -209,13 +211,10 @@ class MemScanner:
 class GuidedScanner:
 
     def __init__(self, process_name: str):
-        self._pname  = process_name
-        self._handle = self._attach()
+        self._pname   = process_name
+        self._handle  = self._attach()
         self._scanner = MemScanner(self._handle)
-        # stage_name -> {addr: int32_value_at_that_stage}
         self._stage_values: dict[str, dict[int, int]] = {}
-
-    # ── Process attach ─────────────────────────────────────────────────────
 
     def _attach(self) -> int:
         try:
@@ -243,8 +242,6 @@ class GuidedScanner:
             "      python memory_scanner.py CrimsonDesert-Win64-Shipping.exe\n"
         )
 
-    # ── F6 trigger ─────────────────────────────────────────────────────────
-
     def _wait_f6(self, label: str, prompt: str) -> bool:
         ev = threading.Event()
 
@@ -270,14 +267,13 @@ class GuidedScanner:
             print(f"  Timed out on '{label}' — skipping this stage.")
         return fired
 
-    # ── Main flow ──────────────────────────────────────────────────────────
-
     def run(self) -> None:
         print("\n=== Crimson Desert Fishing State Scanner ===")
         print(
             "Stay in-game. Press F6 at each prompt — no Alt-Tab needed.\n"
             "Each step has a 3-minute window before it times out and skips.\n"
             "Tip: have the fishing minigame ready to go before starting.\n"
+            "The BACK TO IDLE step at the end is critical — don't skip it.\n"
         )
 
         for i, (stage, prompt) in enumerate(STAGES):
@@ -286,38 +282,35 @@ class GuidedScanner:
                 continue
 
             if i == 0:
-                # Baseline — snapshot everything, no diff yet
                 print("  Taking baseline snapshot…")
                 self._scanner.snapshot()
-                # Record the initial idle values once we have a candidate list
-                # (will be populated after first diff narrows things down)
             else:
                 print("  Scanning for changes…")
                 self._scanner.diff_changed()
-                self._scanner.filter_range(0, 128)
+                self._scanner.filter_range(STATE_RANGE_LO, STATE_RANGE_HI)
 
             self._stage_values[stage] = self._scanner.current_values()
             print(f"  Candidates: {self._scanner.count:,}")
 
         self._analyze_and_save()
 
-    # ── Analysis & save ────────────────────────────────────────────────────
+    # ── Analysis ───────────────────────────────────────────────────────────
 
     def _analyze_and_save(self) -> None:
         print("\n\n  Analysing candidates…")
 
         stage_names = [s for s, _ in STAGES if s in self._stage_values]
-        if len(stage_names) < 2:
-            print("  ERROR: fewer than 2 stages captured — re-run the scanner.")
-            return
-
-        # Only look at stages after idle (idle has no diff yet in our approach)
         diff_stages = [s for s in stage_names if s != "idle"]
 
-        # Collect all candidate addresses across all diff stages
+        if len(diff_stages) < 2:
+            print("  ERROR: fewer than 2 diff stages captured — re-run the scanner.")
+            return
+
         all_addrs: set[int] = set()
         for s in diff_stages:
             all_addrs.update(self._stage_values[s].keys())
+
+        have_idle_return = "idle_return" in diff_stages
 
         scored: list[tuple[int, int, dict[str, int]]] = []
 
@@ -325,54 +318,113 @@ class GuidedScanner:
             stage_vals: dict[str, int] = {}
             for s in diff_stages:
                 v = self._stage_values[s].get(addr)
-                if v is not None and 0 <= v <= 128:
+                if v is not None and STATE_RANGE_LO <= v <= STATE_RANGE_HI:
                     stage_vals[s] = v
 
             if len(stage_vals) < 2:
                 continue
 
-            n_distinct = len(set(stage_vals.values()))
+            values = list(stage_vals.values())
+
+            # Require ALL captured stage values to be distinct.
+            if len(set(values)) != len(values):
+                continue
+
+            # idle_return must differ from caught (the state just before it).
+            if have_idle_return and "caught" in stage_vals:
+                if stage_vals["idle_return"] == stage_vals["caught"]:
+                    continue
+
+            n_distinct = len(set(values))
             scored.append((n_distinct, addr, stage_vals))
 
         if not scored:
             print(
-                "  No suitable candidates found.\n"
-                "  Tips:\n"
-                "    • Make sure each F6 press was at the correct fishing stage.\n"
-                "    • Try running the scanner again with more deliberate timing.\n"
-                "    • Reduce MAX_REGION_BYTES if scan is too slow.\n"
+                "  No suitable candidates survived the strict filters.\n"
+                "  Try again with more deliberate F6 timing, especially:\n"
+                "    • BITE: press F6 the instant the camera dips\n"
+                "    • BACK TO IDLE: press F6 after the fish is fully stowed\n"
+                "  If the problem persists, the state may be in a sub-region\n"
+                "  larger than 64 MB — try increasing MAX_REGION_BYTES.\n"
             )
             return
 
         scored.sort(key=lambda x: -x[0])
-        top = scored[:10]
 
-        print(f"\n  Top {len(top)} candidates:\n")
-        print(f"  {'Rank':<5} {'Address':<20} {'Distinct':<10} Stage values")
-        print(f"  {'----':<5} {'-------':<20} {'--------':<10} ------------")
+        # ── Stability check ────────────────────────────────────────────────
+        print(f"\n  Running stability check on top {min(20, len(scored))} candidates…")
+        stable_scored: list[tuple[int, int, dict[str, int]]] = []
+
+        for n_dist, addr, svals in scored[:20]:
+            readings: list[Optional[int]] = []
+            for _ in range(STABILITY_READS):
+                readings.append(self._scanner.read_current(addr))
+                time.sleep(STABILITY_DELAY)
+
+            valid = [r for r in readings if r is not None]
+            if not valid:
+                continue
+
+            # Accept only if all reads returned the same value
+            if len(set(valid)) == 1:
+                stable_scored.append((n_dist, addr, svals))
+
+        if not stable_scored:
+            print(
+                "  All top candidates fluctuated during stability check.\n"
+                "  The address is likely in a frequently-written buffer.\n"
+                "  Re-run the scanner with better F6 timing.\n"
+            )
+            return
+
+        print(f"  {len(stable_scored)} stable candidate(s) remain.\n")
+
+        # ── Display & interactive selection ───────────────────────────────
+        top = stable_scored[:10]
+        diff_stage_order = [s for s, _ in STAGES if s in diff_stages]
+
+        header_stages = "  ".join(f"{s[:10]:>10}" for s in diff_stage_order)
+        print(f"  {'Rank':<5} {'Address':<20} {header_stages}")
+        print(f"  {'----':<5} {'-------':<20} " + "  ".join(["-" * 10] * len(diff_stage_order)))
+
         for rank, (n_dist, addr, svals) in enumerate(top):
-            vals_str = "  ".join(f"{s}={v}" for s, v in sorted(svals.items()))
-            print(f"  [{rank}]  0x{addr:016X}  {n_dist:<10}  {vals_str}")
+            vals_str = "  ".join(
+                f"{svals.get(s, '?'):>10}" for s in diff_stage_order
+            )
+            print(f"  [{rank}]   0x{addr:016X}  {vals_str}")
 
-        # Auto-select: most distinct values across the most stages
-        best_n, best_addr, best_vals = top[0]
-        print(f"\n  Auto-selected: 0x{best_addr:016X}")
-        print(f"  Value map:     {best_vals}")
+        print()
 
-        # value -> stage_name  (reverse map for runtime lookup)
-        value_to_stage: dict[int, str] = {}
-        for stage, val in best_vals.items():
-            value_to_stage[val] = stage
+        if len(top) == 1:
+            chosen_idx = 0
+            print("  Only one candidate — auto-selecting [0].")
+        else:
+            print(
+                "  Look at the table above.  The correct address should:\n"
+                "    • Have a different integer for every stage\n"
+                "    • Show a low value (e.g. 0 or 1) for idle_return\n"
+                "    • Have values that loosely increase through the cycle\n"
+            )
+            raw = input("  Enter rank number to select [0]: ").strip()
+            try:
+                chosen_idx = int(raw) if raw else 0
+                if not (0 <= chosen_idx < len(top)):
+                    chosen_idx = 0
+            except ValueError:
+                chosen_idx = 0
 
-        # Save to config
+        _, best_addr, best_vals = top[chosen_idx]
+        print(f"\n  Selected: 0x{best_addr:016X}")
+        print(f"  Values:   {best_vals}")
+
+        value_to_stage: dict[int, str] = {v: s for s, v in best_vals.items()}
+
         cfg = config.load()
         cfg.setdefault("memory", {})
         cfg["memory"]["enabled"]       = True
         cfg["memory"]["process_name"]  = self._pname
         cfg["memory"]["state_address"] = best_addr
-        # JSON keys must be strings
         cfg["memory"]["state_map"]     = {str(v): s for v, s in value_to_stage.items()}
-
         config.save(cfg)
 
         print(f"\n  Saved to config.json.")
