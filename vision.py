@@ -120,7 +120,7 @@ def detect_color(
 
 
 # ---------------------------------------------------------------------------
-# Bite detection — motion burst in the water region
+# Bite detection
 # ---------------------------------------------------------------------------
 
 def detect_bite_motion(
@@ -147,26 +147,35 @@ def detect_bite_motion(
     return mean_diff >= motion_threshold, mean_diff
 
 
-def detect_bite_camera_shift(
+def detect_bite_scene_change(
     frame_prev: np.ndarray,
     frame_curr: np.ndarray,
-    dy_threshold: float = 3.0,
+    threshold: float = 25.0,
 ) -> tuple[bool, float]:
     """
-    Detect a downward camera shift that signals a fish bite in Crimson Desert.
+    Detect the dramatic camera tilt that occurs when a fish bites in
+    Crimson Desert.
 
-    When a fish bites, the camera jerks noticeably downward.  Phase correlation
-    on a large centre-screen region measures the inter-frame displacement;
-    |dy| exceeding dy_threshold (default 3 px) while the camera was previously
-    still is the trigger.
+    When a fish bites the camera pitches sharply downward — the horizon
+    shifts from ~30% to ~10% of the frame height and water fills the
+    majority of the screen.  This creates a very large mean-absolute-
+    difference (typically 25–60) between consecutive frames captured on
+    the centre-screen motion_sample region, far above the idle ripple
+    baseline (1–5) and gradual fight panning (5–15).
 
-    Returns (detected, abs_dy).
+    We use simple mean-abs-diff rather than phaseCorrelate here because
+    the angular change is large enough that frame content no longer
+    overlaps, which causes phaseCorrelate to alias and return incorrect
+    displacement vectors.
+
+    Returns (detected, mean_diff).
     """
     if frame_prev is None or frame_curr is None:
         return False, 0.0
-    _, dy = measure_camera_motion(frame_prev, frame_curr)
-    abs_dy = abs(dy)
-    return abs_dy >= dy_threshold, abs_dy
+    g1 = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
+    mean_diff = float(cv2.absdiff(g1, g2).mean())
+    return mean_diff >= threshold, mean_diff
 
 
 def detect_bite(
@@ -305,14 +314,40 @@ def detect_catch_complete(
     threshold: float = 0.80,
 ) -> tuple[bool, float]:
     """
-    Template match for the player holding the caught fish.
+    Detect the fish-caught state using template match (primary) or the
+    distinctive golden fish-info panel that appears bottom-right
+    (fallback — no template required).
+
+    Crimson Desert shows a golden-text info panel (fish name, size,
+    description, illustration) in the bottom-right corner the moment the
+    character holds up the caught fish.  Detecting a sufficient density of
+    golden/amber pixels in that region is reliable and needs no calibration.
+
     Returns (detected, confidence).
     """
     frame = grab_region(region)
     if frame is None:
         return False, 0.0
+
+    # Primary: template match if one has been captured
     if template_path:
-        return match_template(frame, template_path, threshold)
+        detected, conf = match_template(frame, template_path, threshold)
+        if detected:
+            return True, conf
+
+    # Fallback: golden info-panel colour detection.
+    # The fish name text is a warm amber-gold: HSV H≈30-48, S≈140-255, V≈160-255.
+    hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask  = cv2.inRange(
+        hsv,
+        np.array([28, 140, 160], dtype=np.uint8),
+        np.array([48, 255, 255], dtype=np.uint8),
+    )
+    ratio = float(np.count_nonzero(mask)) / max(float(mask.size), 1)
+    # ~1 % golden pixels in the catch_indicator region is a strong signal
+    if ratio >= 0.01:
+        return True, min(ratio / 0.03, 1.0)
+
     return False, 0.0
 
 

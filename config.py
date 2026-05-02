@@ -21,12 +21,17 @@ _DEFAULTS: dict = {
     "direction_keys": {"left": "a", "right": "d", "up": "w", "down": "s"},
     "hotkeys": {"emergency_stop": "f8", "pause_resume": "f7"},
     "regions": {
-        # Center-ish crop for bite splash detection
+        # Water area around the float — used for splash motion detection fallback.
+        # Point this at the part of the water where the line lands.
         "bite_indicator": {"left": 560, "top": 200, "width": 800, "height": 480},
-        # Center half of the screen — used for optical flow / camera motion
+        # Large centre-screen region used for camera-motion detection (both bite
+        # scene-change detection and fight-phase phaseCorrelate direction tracking).
+        # Bigger = more stable phase-correlation result.
         "motion_sample": {"left": 480, "top": 270, "width": 960, "height": 540},
-        # Lower-center area where character holds the caught fish
-        "catch_indicator": {"left": 680, "top": 600, "width": 560, "height": 280},
+        # Bottom-right area where the golden fish-info panel appears after a catch.
+        # Should cover the right ~38% of screen width and lower ~35% of height.
+        # Default tuned for 1920×1080; recalibrate for other resolutions.
+        "catch_indicator": {"left": 1100, "top": 650, "width": 820, "height": 380},
     },
     "templates": {
         "bite": None,
@@ -41,12 +46,12 @@ _DEFAULTS: dict = {
     },
     "thresholds": {
         "bite_template": 0.78,
-        # Mean per-pixel brightness change that counts as a motion burst (bite splash)
+        # Mean per-pixel brightness diff on bite_indicator for water-splash detection.
         "bite_motion": 18.0,
-        # Minimum |dy| from phaseCorrelate on the motion_sample region to count as a bite.
-        # Crimson Desert shifts the camera down noticeably when a fish bites (~3–6 px).
-        # Lower this if bites are missed; raise it if idle camera drift triggers false positives.
-        "bite_camera_dy": 3.0,
+        # Mean per-pixel brightness diff on motion_sample for the dramatic bite
+        # camera tilt.  Idle water ≈ 1–5, fight panning ≈ 5–15, bite tilt ≈ 25–60.
+        # Lower if bites are missed; raise if ambient scene changes false-trigger.
+        "bite_scene_change": 25.0,
         "catch_complete": 0.80,
         "color_pixel_ratio": 0.04,
     },
@@ -60,7 +65,11 @@ _DEFAULTS: dict = {
     },
     "delays": {
         "after_cast_settle": 1.5,
-        "bite_poll_interval": 0.12,
+        "bite_poll_interval": 0.10,
+        # Wait after bite detected before right-clicking to hook.
+        # ~1 s gives the animation time to settle so the click registers.
+        "pre_hook_wait_min": 0.8,
+        "pre_hook_wait_max": 1.2,
         "after_hook_min": 0.25,
         "after_hook_max": 0.55,
         "fight_frame_interval": 0.08,

@@ -143,33 +143,38 @@ class FishingLoop:
 
     def _wait_for_bite(self, cfg: dict, delays: dict) -> bool:
         """
-        Poll for a fish bite using two parallel detectors:
+        Poll for a fish bite.
 
-        1. Camera-shift (primary) — phaseCorrelate on motion_sample.
-           Crimson Desert shifts the camera noticeably downward when a fish bites.
-           |dy| > bite_camera_dy threshold triggers this detector.
+        Primary detector — scene-change on motion_sample (centre screen):
+          When a fish bites, Crimson Desert pitches the camera sharply
+          downward.  The horizon rises from ~30 % to ~10 % of the frame
+          and water fills the majority of the screen.  Mean-abs-diff on
+          the centre region typically jumps to 25–60 at bite time versus
+          a 1–5 baseline during idle ripple.  phaseCorrelate is NOT used
+          here because the angular change is large enough to alias.
 
-        2. Motion burst (fallback) — frame-diff on bite_indicator.
-           Catches visible water-splash changes if camera shift is below threshold.
+        Fallback — splash motion burst on bite_indicator:
+          Catches the water disturbance if the scene-change threshold is
+          set higher than needed.
 
-        Template matching and colour threshold are also tried if configured.
-        Returns True on any detection, False on timeout.
+        Template matching and colour fallback are also tried if configured.
+        Returns True on bite, False on timeout.
         """
         self._status("Waiting for bite…")
-        timeout = cfg.get("max_bite_wait_seconds", 90)
+        timeout  = cfg.get("max_bite_wait_seconds", 90)
         deadline = time.monotonic() + timeout
         interval = delays["bite_poll_interval"]
 
-        thresholds   = cfg["thresholds"]
-        region_bite  = cfg["regions"].get("bite_indicator")
-        region_cam   = cfg["regions"].get("motion_sample")
-        tmpl         = cfg["templates"].get("bite")
-        color_cfg    = cfg["color_ranges"].get("bite")
-        dy_threshold = thresholds.get("bite_camera_dy", 3.0)
+        thresholds     = cfg["thresholds"]
+        region_cam     = cfg["regions"].get("motion_sample")
+        region_bite    = cfg["regions"].get("bite_indicator")
+        tmpl           = cfg["templates"].get("bite")
+        color_cfg      = cfg["color_ranges"].get("bite")
+        sc_threshold   = thresholds.get("bite_scene_change", 25.0)
+        mot_threshold  = thresholds["bite_motion"]
 
-        # Seed previous frames for both detectors
-        prev_bite = vision.grab_region(region_bite)
         prev_cam  = vision.grab_region(region_cam)
+        prev_bite = vision.grab_region(region_bite)
 
         while time.monotonic() < deadline:
             if ic.is_stopped():
@@ -177,32 +182,31 @@ class FishingLoop:
             while ic.is_paused():
                 ic.safe_sleep(0.1)
 
-            # ── Detector 1: camera downward shift ──────────────────────────
+            # ── Primary: dramatic scene change (camera pitch at bite) ──────
             curr_cam = vision.grab_region(region_cam)
             if curr_cam is not None and prev_cam is not None:
-                cam_hit, abs_dy = vision.detect_bite_camera_shift(
-                    prev_cam, curr_cam, dy_threshold=dy_threshold
+                hit, diff = vision.detect_bite_scene_change(
+                    prev_cam, curr_cam, threshold=sc_threshold
                 )
-                self._gui.set_confidence(abs_dy / max(dy_threshold, 1e-6))
-                logger.debug("Bite cam-shift: dy=%.2f threshold=%.2f", abs_dy, dy_threshold)
-                if cam_hit:
-                    logger.info("Bite detected via camera shift! |dy|=%.2f", abs_dy)
+                self._gui.set_confidence(min(diff / max(sc_threshold, 1e-6), 1.0))
+                if hit:
+                    logger.info("Bite! scene-change diff=%.1f (threshold %.1f)", diff, sc_threshold)
                     return True
                 prev_cam = curr_cam
 
-            # ── Detector 2: splash motion burst + template + colour ────────
+            # ── Fallback: water-splash frame-diff + template + colour ──────
             detected, conf, prev_bite = vision.detect_bite(
                 region=region_bite,
                 template_path=tmpl,
                 prev_frame=prev_bite,
                 color_cfg=color_cfg,
                 template_threshold=thresholds["bite_template"],
-                motion_threshold=thresholds["bite_motion"],
+                motion_threshold=mot_threshold,
                 color_pixel_ratio=thresholds["color_pixel_ratio"],
             )
             if detected:
                 self._gui.set_confidence(conf)
-                logger.info("Bite detected via motion burst! conf=%.3f", conf)
+                logger.info("Bite! motion-burst conf=%.3f", conf)
                 return True
 
             ic.safe_sleep(interval)
@@ -214,10 +218,18 @@ class FishingLoop:
     # ------------------------------------------------------------------
 
     def _hook(self, cfg: dict, delays: dict) -> None:
-        self._status("Hooking!")
+        # Wait a moment after bite before clicking — lets the animation settle
+        # so the right-click registers as a hook rather than being dropped.
+        pre_wait = (
+            delays.get("pre_hook_wait_min", 0.8)
+            + (delays.get("pre_hook_wait_max", 1.2) - delays.get("pre_hook_wait_min", 0.8))
+            * __import__("random").random()
+        )
+        self._status(f"Bite! Hooking in {pre_wait:.1f}s…")
+        ic.safe_sleep(pre_wait)
         ic.click_mouse(cfg["hook_button"])
         ic.random_sleep(delays["after_hook_min"], delays["after_hook_max"])
-        logger.info("Hook click sent.")
+        logger.info("Hook click sent (pre-wait %.2fs).", pre_wait)
 
     # ------------------------------------------------------------------
     # Phase: Fight
