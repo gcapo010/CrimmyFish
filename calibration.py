@@ -27,6 +27,8 @@ import threading
 import tkinter as tk
 from typing import Callable, Optional
 
+from pynput import keyboard as kb
+
 import config
 import logger
 import vision
@@ -142,6 +144,10 @@ class RegionSelector:
 # Calibration manager
 # ---------------------------------------------------------------------------
 
+CAPTURE_HOTKEY = "f6"   # Global key pressed in-game to trigger a template capture
+CAPTURE_TIMEOUT = 60    # Seconds to wait before skipping if no key pressed
+
+
 class CalibrationManager:
     def __init__(self, status_callback: Optional[Callable[[str], None]] = None):
         self._cb = status_callback or (lambda _: None)
@@ -149,6 +155,43 @@ class CalibrationManager:
     def _status(self, msg: str) -> None:
         logger.info(msg)
         self._cb(msg)
+
+    def _wait_for_hotkey(self, prompt: str) -> bool:
+        """
+        Display *prompt* in the status bar, then block until the user presses
+        the global capture hotkey (F6) from anywhere — including while the game
+        window is in the foreground.
+
+        Returns True if the hotkey was pressed within CAPTURE_TIMEOUT seconds,
+        False if the wait timed out or was interrupted.
+        """
+        triggered = threading.Event()
+
+        def on_press(key):
+            try:
+                name = key.name if hasattr(key, "name") else key.char
+                if name and name.lower() == CAPTURE_HOTKEY:
+                    triggered.set()
+                    return False  # Stop this listener
+            except AttributeError:
+                pass
+
+        self._status(
+            f"{prompt}\n"
+            f"→ Switch to the game, get the state visible, then press "
+            f"{CAPTURE_HOTKEY.upper()} (you do NOT need to Alt-Tab back)."
+        )
+
+        listener = kb.Listener(on_press=on_press, daemon=True)
+        listener.start()
+        fired = triggered.wait(timeout=CAPTURE_TIMEOUT)
+        listener.stop()
+
+        if not fired:
+            self._status(
+                f"Timed out waiting for {CAPTURE_HOTKEY.upper()} — skipping this template."
+            )
+        return fired
 
     def calibrate_regions(self) -> None:
         """Walk the user through selecting each detection region."""
@@ -182,8 +225,9 @@ class CalibrationManager:
                 )
                 continue
 
-            self._status(_TEMPLATE_PROMPTS[tmpl_key])
-            input(f"  [Calibration] Press Enter when '{tmpl_key}' state is visible in game…")
+            fired = self._wait_for_hotkey(_TEMPLATE_PROMPTS[tmpl_key])
+            if not fired:
+                continue
 
             save_path = os.path.join(TEMPLATE_DIR, f"{tmpl_key}.png")
             ok = vision.save_region_screenshot(region, save_path)
