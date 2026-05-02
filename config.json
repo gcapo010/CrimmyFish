@@ -1,0 +1,69 @@
+{
+  "cast_key": "space",
+  "reel_key": "space",
+  "hook_button": "left",
+  "direction_keys": {
+    "left": "a",
+    "right": "d",
+    "up": "w",
+    "down": "s"
+  },
+  "hotkeys": {
+    "emergency_stop": "f8",
+    "pause_resume": "f7"
+  },
+  "regions": {
+    "bite_indicator": null,
+    "direction_indicator": null,
+    "stamina_indicator": null,
+    "catch_indicator": null
+  },
+  "templates": {
+    "bite": null,
+    "direction_left": null,
+    "direction_right": null,
+    "direction_up": null,
+    "direction_down": null,
+    "tired": null,
+    "catch_complete": null
+  },
+  "color_ranges": {
+    "bite": {
+      "enabled": false,
+      "lower_hsv": [0, 0, 200],
+      "upper_hsv": [180, 30, 255]
+    },
+    "tired": {
+      "enabled": false,
+      "lower_hsv": [90, 50, 50],
+      "upper_hsv": [130, 255, 255]
+    },
+    "catch_complete": {
+      "enabled": false,
+      "lower_hsv": [35, 50, 50],
+      "upper_hsv": [85, 255, 255]
+    }
+  },
+  "thresholds": {
+    "bite": 0.80,
+    "direction": 0.75,
+    "tired": 0.80,
+    "catch_complete": 0.80,
+    "color_pixel_ratio": 0.05
+  },
+  "delays": {
+    "after_cast_min": 0.5,
+    "after_cast_max": 1.0,
+    "bite_poll_interval": 0.1,
+    "after_hook_min": 0.2,
+    "after_hook_max": 0.5,
+    "fight_poll_interval": 0.05,
+    "direction_key_hold": 0.15,
+    "after_reel_min": 1.0,
+    "after_reel_max": 2.0,
+    "loop_restart_min": 0.8,
+    "loop_restart_max": 1.5
+  },
+  "max_bite_wait_seconds": 60,
+  "max_fight_seconds": 120
+}
