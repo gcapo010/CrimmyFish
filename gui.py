@@ -186,6 +186,13 @@ class FishingGUI:
         self._on_pause     = on_pause
         self._on_calibrate = on_calibrate
 
+        self._root = tk.Tk()
+        self._root.title("CrimmyFish — Auto Fishing Assistant")
+        self._root.configure(bg=_WIN_BG)
+        self._root.resizable(False, False)
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # StringVars must be created after tk.Tk() exists (enforced in Python 3.14+)
         self._status_var = tk.StringVar(value="Idle")
         self._conf_var   = tk.StringVar(value="—")
         self._count_var  = tk.StringVar(value="0")
@@ -193,12 +200,6 @@ class FishingGUI:
 
         self._logo_img:  Optional[ImageTk.PhotoImage] = None
         self._pause_btn: Optional[OrnateButton]        = None
-
-        self._root = tk.Tk()
-        self._root.title("CrimmyFish — Auto Fishing Assistant")
-        self._root.configure(bg=_WIN_BG)
-        self._root.resizable(False, False)
-        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
 
